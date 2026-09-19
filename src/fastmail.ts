@@ -50,7 +50,9 @@ import {
   fetchAccountInfo,
   fetchIdentityEmail,
   getMessages,
+  getReplySource,
   getThreadMetadata,
+  replyRecipients,
   listMailboxes,
   queryThreadPage,
   resolveSendContext,
@@ -58,6 +60,7 @@ import {
   updateEmails,
   type FastmailAccountInfo,
   type RawThreadEntry,
+  type SendEmailParams,
 } from "./fastmail-api";
 import type { JmapEmailObject, JmapMailboxObject } from "./fastmail-types";
 import { FASTMAIL_RESOURCE, parseResourceUrl, SUPPORTED_RESOURCES, toResourceUrl } from "./resource";
@@ -646,6 +649,14 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
       for (const emailId of pending.emailIds) {
         clearSimulatedKeywordsIfLatest(this.ctx.storage.kv, emailId, actionId);
       }
+    } else if (pending.answersEmailId) {
+      // Best-effort, after the record is gone: the reply has already been sent, so failing (or
+      // retrying) the approval over a missing "$answered" flag would be worse than the flag.
+      const grant = await this.#userAccount().getGrant();
+      await updateEmails(
+        grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, [pending.answersEmailId],
+        { "keywords/$answered": true },
+      ).catch(error => logError("apply.markAnsweredFailed", error, { actionId }));
     }
   }
 
@@ -697,6 +708,62 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
   }
 
   async removeObserver(_id: string): Promise<void> {}
+}
+
+// ---------------------------------------------------------------------------
+// Sending, shared by FastmailSessionImpl.send() and FastmailThreadImpl.reply()
+
+function nextActionId(kv: DurableObjectStorage["kv"]): number {
+  const actionId = kv.get<number>("action:nextId") ?? 1;
+  kv.put("action:nextId", actionId + 1);
+  return actionId;
+}
+
+/** The address to send from, or a `SUBMISSION_NOT_AUTHORIZED` error if this grant cannot send. */
+function requireSender(grant: StoredGrant): string {
+  if (!grant.hasSubmission) {
+    throw new FastmailError(
+      "SUBMISSION_NOT_AUTHORIZED",
+      "This Fastmail connection's API token does not grant Email submission, so it cannot send " +
+      "mail. Reconnect with a token that includes Email submission scope to enable sending.");
+  }
+  if (!grant.identityEmail) {
+    throw new FastmailError(
+      "SUBMISSION_NOT_AUTHORIZED", "Could not determine this account's own address to send from.");
+  }
+  return grant.identityEmail;
+}
+
+function toJmapAddresses(addresses: FastmailAddress[] | undefined): SendEmailParams["to"] | undefined {
+  return addresses?.map(address => ({ email: address.email, name: address.name }));
+}
+
+async function stageSend(
+  approvalQueue: RpcStub<ApprovalQueue>, kv: DurableObjectStorage["kv"],
+  pending: { params: SendEmailParams; answersEmailId?: string }, title: string,
+): Promise<void> {
+  const actionId = nextActionId(kv);
+  setPendingAction(kv, actionId, { kind: "send", ...pending });
+  // Not cleaned up on a thrown error: the overseer commits the action record durably before
+  // submitAction() returns, so a failure reaching this await (e.g. a dropped RPC response) can
+  // mean the submission actually succeeded server-side even though this call sees an error.
+  // Deleting the pending record here would then permanently orphan an action the overseer still
+  // considers pending and approvable — applyAction() would find nothing when it's later approved.
+  // An orphaned record from a genuine pre-commit rejection is harmless (never referenced again).
+  const { params } = pending;
+  const recipients = [...params.to, ...params.cc ?? [], ...params.bcc ?? []]
+    .map(address => address.email).join(", ");
+  try {
+    await approvalQueue.submitAction(actionId, {
+      title,
+      description: `${title}: "${params.subject}" to ${recipients}.`,
+      // Sending is irreversible: EmailSubmission has no "unsend".
+      implementsRevert: false,
+    });
+  } catch (error) {
+    logError("send.submitFailed", error, { actionId });
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -801,54 +868,19 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
     options?: { cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
   ): Promise<void> {
     const grant = await this.#account.getGrant();
-    if (!grant.hasSubmission) {
-      throw new FastmailError(
-        "SUBMISSION_NOT_AUTHORIZED",
-        "This Fastmail connection's API token does not grant Email submission, so it cannot send " +
-        "mail. Reconnect with a token that includes Email submission scope to enable sending.");
-    }
-    if (!grant.identityEmail) {
-      throw new FastmailError(
-        "SUBMISSION_NOT_AUTHORIZED", "Could not determine this account's own address to send from.");
-    }
-
-    const actionId = this.#nextActionId();
-    setPendingAction(this.#kv, actionId, {
-      kind: "send",
+    await stageSend(this.#approvalQueue, this.#kv, {
       params: {
-        from: grant.identityEmail,
-        to: to.map(address => ({ email: address.email, name: address.name })),
-        cc: options?.cc?.map(address => ({ email: address.email, name: address.name })),
-        bcc: options?.bcc?.map(address => ({ email: address.email, name: address.name })),
+        from: requireSender(grant),
+        to: toJmapAddresses(to) ?? [],
+        cc: toJmapAddresses(options?.cc),
+        bcc: toJmapAddresses(options?.bcc),
         subject,
         textBody: body.text,
         htmlBody: body.html,
       },
-    });
-    // Not cleaned up on a thrown error: the overseer commits the action record durably before
-    // submitAction() returns, so a failure reaching this await (e.g. a dropped RPC response) can
-    // mean the submission actually succeeded server-side even though this call sees an error.
-    // Deleting the pending record here would then permanently orphan an action the overseer still
-    // considers pending and approvable — applyAction() would find nothing when it's later approved.
-    // An orphaned record from a genuine pre-commit rejection is harmless (never referenced again).
-    try {
-      await this.#approvalQueue.submitAction(actionId, {
-        title: "Send email",
-        description: `Send "${subject}" to ${to.map(address => address.email).join(", ")}.`,
-        // Sending is irreversible: EmailSubmission has no "unsend".
-        implementsRevert: false,
-      });
-    } catch (error) {
-      logError("send.submitFailed", error, { actionId });
-      throw error;
-    }
+    }, "Send email");
   }
 
-  #nextActionId(): number {
-    const actionId = this.#kv.get<number>("action:nextId") ?? 1;
-    this.#kv.put("action:nextId", actionId + 1);
-    return actionId;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -890,11 +922,6 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
     }
   }
 
-  #nextActionId(): number {
-    const actionId = this.#kv.get<number>("action:nextId") ?? 1;
-    this.#kv.put("action:nextId", actionId + 1);
-    return actionId;
-  }
 
   async messages(): Promise<FastmailMessage[]> {
     const grant = await this.#account.getGrant();
@@ -905,6 +932,39 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
       description: `Read ${emails.length} message(s) in this thread.`,
     });
     return emails.map(email => toAgentMessage(email, getSimulatedKeywords(this.#kv, email.id)));
+  }
+
+  async reply(
+    body: { text?: string; html?: string },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+  ): Promise<void> {
+    const grant = await this.#account.getGrant();
+    const from = requireSender(grant);
+    const source = await this.#call(() => getReplySource(
+      grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, this.#messageIds));
+    if (!source) throw new FastmailError("RESOURCE_NOT_FOUND", "This thread has no message to reply to.");
+
+    const recipients = replyRecipients(source, from, options?.replyAll ?? false);
+    const cc = [...recipients.cc, ...toJmapAddresses(options?.cc) ?? []];
+    if (recipients.to.length === 0 && cc.length === 0) {
+      throw new FastmailError("RESOURCE_NOT_FOUND", "Could not determine who to reply to.");
+    }
+    const subject = source.subject ?? "";
+    const messageIds = source.messageId ?? [];
+    await stageSend(this.#approvalQueue, this.#kv, {
+      params: {
+        from,
+        to: recipients.to,
+        cc: cc.length > 0 ? cc : undefined,
+        bcc: toJmapAddresses(options?.bcc),
+        subject: /^re:/i.test(subject.trim()) ? subject : `Re: ${subject}`,
+        textBody: body.text,
+        htmlBody: body.html,
+        inReplyTo: messageIds.length > 0 ? messageIds : undefined,
+        references: messageIds.length > 0 ? [...source.references ?? [], ...messageIds] : undefined,
+      },
+      answersEmailId: source.id,
+    }, "Reply to email");
   }
 
   async readAttachment(blobId: string): Promise<ArrayBuffer> {
@@ -927,7 +987,7 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
   }
 
   async #submitPatch(title: string, description: string, patch: Record<string, unknown>): Promise<void> {
-    const actionId = this.#nextActionId();
+    const actionId = nextActionId(this.#kv);
     setPendingAction(this.#kv, actionId, { kind: "patch", emailIds: this.#messageIds, patch });
     // Not cleaned up on a thrown error — see the matching comment in FastmailSessionImpl.send():
     // the overseer commits the action record before submitAction() returns, so deleting the local
@@ -942,7 +1002,7 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
   }
 
   async #patchKeyword(keyword: string, present: boolean, title: string): Promise<void> {
-    const actionId = this.#nextActionId();
+    const actionId = nextActionId(this.#kv);
     setPendingAction(this.#kv, actionId, {
       kind: "patch",
       emailIds: this.#messageIds,

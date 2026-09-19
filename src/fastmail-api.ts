@@ -250,6 +250,54 @@ export async function getMessages(
   return (result.list as JmapEmailObject[] | undefined) ?? [];
 }
 
+/** What a reply needs from the message it answers: its threading headers and addressees. */
+export type JmapReplySource = Pick<
+  JmapEmailObject,
+  "id" | "messageId" | "references" | "from" | "to" | "cc" | "replyTo" | "subject" | "receivedAt"
+>;
+
+const REPLY_SOURCE_PROPERTIES =
+  ["id", "messageId", "references", "from", "to", "cc", "replyTo", "subject", "receivedAt"];
+
+/** Fetches the thread's most recent message (by `receivedAt`) with the headers a reply needs. */
+export async function getReplySource(
+  apiUrl: string, apiToken: string, accountId: string, hasSubmission: boolean, messageIds: string[],
+  fetchImpl: typeof fetch = fetch,
+): Promise<JmapReplySource | undefined> {
+  if (messageIds.length === 0) return undefined;
+  const result = await call(apiUrl, apiToken, usingFor(hasSubmission), "Email/get", {
+    accountId, ids: messageIds, properties: REPLY_SOURCE_PROPERTIES,
+  }, fetchImpl);
+  const list = (result.list as JmapReplySource[] | undefined) ?? [];
+  return list.reduce<JmapReplySource | undefined>(
+    (latest, email) => !latest || email.receivedAt > latest.receivedAt ? email : latest, undefined);
+}
+
+function isSameAddress(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase();
+}
+
+/** Addressees for a reply to `source`, sent from `self`. Replying to your own most recent message
+ * continues to its recipients; otherwise it goes to the Reply-To (or From) address. */
+export function replyRecipients(
+  source: JmapReplySource, self: string, replyAll: boolean,
+): { to: JmapEmailAddress[]; cc: JmapEmailAddress[] } {
+  const fromSelf = (source.from ?? []).some(address => isSameAddress(address.email, self));
+  const primary = fromSelf
+    ? source.to ?? []
+    : source.replyTo?.length ? source.replyTo : source.from ?? [];
+  const seen = new Set([self.toLowerCase()]);
+  const pick = (addresses: JmapReplySource["to"]) => (addresses ?? []).filter(address => {
+    const key = address.email.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).map(address => ({ email: address.email, name: address.name ?? undefined }));
+  const to = pick(primary);
+  const cc = replyAll ? pick([...(fromSelf ? [] : source.to ?? []), ...source.cc ?? []]) : [];
+  return { to, cc };
+}
+
 export async function downloadBlob(
   downloadUrlTemplate: string, apiToken: string, accountId: string, blobId: string,
   name: string, mimeType: string, fetchImpl: typeof fetch = fetch,
@@ -295,6 +343,9 @@ export type SendEmailParams = {
   subject: string;
   textBody?: string;
   htmlBody?: string;
+  /** Threading headers for a reply (message ids without angle brackets). */
+  inReplyTo?: string[];
+  references?: string[];
 };
 
 /** The account-specific ids a send needs, resolved at apply time by `resolveSendContext()`. */
@@ -387,6 +438,8 @@ export async function sendEmail(
             cc: params.cc,
             bcc: params.bcc,
             subject: params.subject,
+            inReplyTo: params.inReplyTo,
+            references: params.references,
             bodyValues,
             textBody: textBody.length > 0 ? textBody : undefined,
             htmlBody: htmlBody.length > 0 ? htmlBody : undefined,

@@ -109,6 +109,10 @@ mocked `fetch`; no Fastmail credentials belong in the repository.
   latest overlay for that email.
 - Folder moves do not have a simulated folder-membership view.
 - Sends have no simulation and are irreversible; `send()` resolves when queued, not when delivered.
+- `FastmailThread.reply()` queues the same `send` action with `inReplyTo`/`references` taken from
+  the thread's latest message. Fastmail threads strictly on these Message-ID headers (unlike
+  Gmail's subject heuristic), so a reply sent through plain `send()` lands outside the thread. The
+  answered email is marked `$answered` best-effort after the send succeeds.
 
 ## Development and verification
 

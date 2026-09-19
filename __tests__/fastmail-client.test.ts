@@ -3,8 +3,10 @@ import { FastmailError } from "../src/errors";
 import {
   fetchAccountInfo,
   fetchIdentityEmail,
+  getReplySource,
   listMailboxes,
   queryThreadPage,
+  replyRecipients,
   resolveSendContext,
   sendEmail,
   updateEmails,
@@ -210,6 +212,69 @@ describe("sendEmail", () => {
     }, SEND_CONTEXT, fetchImpl)).rejects.toMatchObject({
       code: "INVALID_RESOURCE", message: expect.stringContaining("bad create"),
     });
+  });
+});
+
+describe("sendEmail threading headers", () => {
+  it("sets inReplyTo and references on a reply's draft", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [
+        ["Email/set", { created: { draft1: { id: "msg2" } } }, "c1"],
+        ["EmailSubmission/set", { created: { submission1: { id: "sub1" } } }, "c2"],
+      ],
+    }));
+    await sendEmail("https://api/", "token", "u1", {
+      from: "me@fastmail.com", to: [{ email: "you@gmail.com" }], subject: "Re: Hi", textBody: "Yes",
+      inReplyTo: ["orig@mail.gmail.com"], references: ["root@x", "orig@mail.gmail.com"],
+    }, SEND_CONTEXT, fetchImpl);
+    const [[, emailSet]] = requestBody(fetchImpl).methodCalls;
+    expect(emailSet.create.draft1.inReplyTo).toEqual(["orig@mail.gmail.com"]);
+    expect(emailSet.create.draft1.references).toEqual(["root@x", "orig@mail.gmail.com"]);
+  });
+});
+
+describe("getReplySource", () => {
+  it("returns the most recent message with its threading headers", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [["Email/get", {
+        list: [
+          { id: "e2", messageId: ["b@x"], receivedAt: "2026-09-19T12:00:00Z" },
+          { id: "e1", messageId: ["a@x"], receivedAt: "2026-09-18T12:00:00Z" },
+        ],
+      }, "c1"]],
+    }));
+    const source = await getReplySource("https://api/", "token", "u1", true, ["e1", "e2"], fetchImpl);
+    expect(source?.id).toBe("e2");
+    expect(requestBody(fetchImpl).methodCalls[0][1].properties)
+      .toEqual(expect.arrayContaining(["messageId", "references", "replyTo"]));
+  });
+});
+
+describe("replyRecipients", () => {
+  const base = { id: "e1", messageId: ["a@x"], references: null, subject: "Hi", receivedAt: "" };
+
+  it("replies to the sender, preferring Reply-To", () => {
+    expect(replyRecipients({
+      ...base, from: [{ email: "you@gmail.com", name: "You" }], replyTo: [{ email: "list@x.org" }],
+      to: [{ email: "me@fastmail.com" }], cc: null,
+    }, "me@fastmail.com", false)).toEqual({ to: [{ email: "list@x.org", name: undefined }], cc: [] });
+  });
+
+  it("reply-all adds other To/Cc recipients but never yourself", () => {
+    expect(replyRecipients({
+      ...base, from: [{ email: "you@gmail.com" }], replyTo: null,
+      to: [{ email: "ME@fastmail.com" }, { email: "bob@x" }], cc: [{ email: "you@gmail.com" }, { email: "c@x" }],
+    }, "me@fastmail.com", true)).toEqual({
+      to: [{ email: "you@gmail.com", name: undefined }],
+      cc: [{ email: "bob@x", name: undefined }, { email: "c@x", name: undefined }],
+    });
+  });
+
+  it("continues to the original recipients when the latest message is your own", () => {
+    expect(replyRecipients({
+      ...base, from: [{ email: "me@fastmail.com" }], replyTo: null,
+      to: [{ email: "you@gmail.com" }], cc: null,
+    }, "me@fastmail.com", false)).toEqual({ to: [{ email: "you@gmail.com", name: undefined }], cc: [] });
   });
 });
 

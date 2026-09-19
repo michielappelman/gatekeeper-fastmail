@@ -125,6 +125,26 @@ export interface FastmailThread {
   /** All messages in this thread, oldest first. */
   messages(): Promise<FastmailMessage[]>;
 
+  /**
+   * Queues a reply to this thread's most recent message, threaded properly (`In-Reply-To` and
+   * `References` are set, the subject gets a `Re:` prefix, and the original is marked
+   * `"$answered"` once sent). It goes to the original's Reply-To/From address; when the most recent
+   * message is one you sent, it goes to that message's recipients instead. `replyAll` also includes
+   * the original's other To/Cc recipients (never your own address). Like `send()`, this resolves
+   * once the reply is queued for approval, and throws `SUBMISSION_NOT_AUTHORIZED` if the token
+   * cannot send. Prefer this over `send()` whenever you are answering an existing message.
+   *
+   * @example
+   * ```ts
+   * const thread = await session.getThread(entry.threadId);
+   * await thread.reply({ text: "Thanks, see you then!" });
+   * ```
+   */
+  reply(
+    body: { text?: string; html?: string },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+  ): Promise<void>;
+
   /** Downloads one attachment's content, by the `blobId` from `FastmailMessage.attachments`. */
   readAttachment(blobId: string): Promise<ArrayBuffer>;
 

@@ -53,7 +53,12 @@ export function putCachedFolders(kv: CacheKv, folders: JmapMailboxObject[], now:
  */
 export type PendingAction =
   | { kind: "patch"; emailIds: string[]; patch: Record<string, unknown> }
-  | { kind: "send"; params: SendEmailParams };
+  | {
+      kind: "send";
+      params: SendEmailParams;
+      /** For a reply: the email being answered, marked `$answered` once the reply is sent. */
+      answersEmailId?: string;
+    };
 
 function pendingActionKey(actionId: number): string {
   return `action:pending:${actionId}`;

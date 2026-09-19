@@ -60,6 +60,11 @@ export type JmapEmailObject = {
   htmlBody?: { partId: string | null }[];
   bodyValues?: Record<string, JmapBodyValue>;
   attachments?: JmapAttachment[];
+  /** The `Message-ID` header's ids, without angle brackets; only when requested. */
+  messageId?: string[] | null;
+  inReplyTo?: string[] | null;
+  references?: string[] | null;
+  replyTo?: JmapEmailAddress[] | null;
 };
 
 /** A JMAP `/api/` request's single method call: `[name, arguments, callId]`. */
