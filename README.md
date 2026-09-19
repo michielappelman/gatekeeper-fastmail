@@ -116,3 +116,7 @@ has no per-observer ACL Fastmail exposes to check a second connected account aga
 - Token rotation is handled by reconnecting with a new token; there is no refresh-token cycle.
 - Fastmail is not a sign-in identity provider (`getAuthenticatedEmail()` returns `null`), even though
   the connected account's own address is knowable.
+
+## License
+
+[MIT](LICENSE)
