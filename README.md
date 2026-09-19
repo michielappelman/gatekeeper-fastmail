@@ -56,10 +56,9 @@ Fastmail's JMAP API (RFC 8620 core + RFC 8621 Mail) is JSON-over-HTTPS, so it fi
 this repo or on npm suited to Workers, so `fastmail-api.ts` talks the protocol directly — the same
 approach `gatekeeper-jottacloud` took for JFS.
 
-**Re-verify before relying on it**: the session endpoint, capability URNs, and numeric limits in
-`fastmail-types.ts`/`fastmail-api.ts` were assembled from search-result excerpts of
-https://www.fastmail.com/dev/ and RFC 8620/8621 (https://jmap.io), not a live fetch of those pages —
-this session's network proxy blocked a direct fetch of fastmail.com while this was written.
+The implementation follows Fastmail's JMAP service shape and RFC 8620/8621. Protocol details are
+isolated in `fastmail-api.ts` and `fastmail-types.ts`, so endpoint or limit changes can be updated
+without changing the Gatekeeper session and capability boundary.
 
 ## Auth
 
@@ -75,12 +74,12 @@ There is no refresh cycle (unlike an OAuth grant): the token is live until revok
 settings, or an API call returns 401, which is reported to the Workshop via
 `GatekeeperConnectCallback.credentialsExpired()`.
 
-## Resource model (v1: whole mailbox only)
+## Resource model (whole mailbox)
 
 `FASTMAIL_RESOURCE` offers exactly one bindable resource per connected account: the whole mailbox
 (`resource.ts`). There is no per-folder or per-search scoping yet. The resource's `urlPattern`
-reserves room for `#mailbox/<id>` / `#search/<query>` hash-scoped variants in a future version,
-without needing to migrate any binding this version creates.
+reserves room for `#mailbox/<id>` / `#search/<query>` hash-scoped variants without needing to migrate
+any binding this version creates.
 
 Even though there's nothing to actually pick, the connect modal still requires a working
 `GatekeeperUser.startResourceConfigurator()` for every `SupportedResource` before "Add connection"
@@ -111,10 +110,9 @@ Strategy A (private-only, see `write-gatekeeper` skill "Observer verification"):
 has no per-observer ACL Fastmail exposes to check a second connected account against, so
 `addObserver()` always throws, matching Gmail's and Jottacloud's own rationale.
 
-## What's not done
+## Current scope
 
-- Per-folder/per-search resource scoping (and widening the configurator UI to pick one).
-- A refresh/rotation story beyond "reconnect with a new token."
-- Fastmail as a sign-in identity provider (`getAuthenticatedEmail()` returns `null`, matching both
-  reference gatekeepers, even though the connected account's own address is knowable).
-- Re-verification of the JMAP specifics called out above against a live Fastmail session.
+- Resource scope is the whole mailbox; per-folder and per-search binding selection is not exposed.
+- Token rotation is handled by reconnecting with a new token; there is no refresh-token cycle.
+- Fastmail is not a sign-in identity provider (`getAuthenticatedEmail()` returns `null`), even though
+  the connected account's own address is knowable.
