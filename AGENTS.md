@@ -82,7 +82,9 @@ Important protocol details:
 - Discover `apiUrl`, download/upload templates, the primary Mail `accountId`, and capabilities from
   `https://api.fastmail.com/jmap/session` using `Authorization: Bearer <apiToken>`.
 - Use JMAP Core + Mail capabilities for reads and mutations; include Submission only when the token
-  supports it. `sendEmail()` creates a draft and submits it in one JMAP request.
+  supports it. At approval time, `resolveSendContext()` looks up the Drafts/Sent mailboxes and the
+  sending Identity; `sendEmail()` then creates the draft in Drafts and submits it with that
+  `identityId` in one JMAP request, moving it to Sent via `onSuccessUpdateEmail`.
 - Thread listings use `Email/query` followed by `Email/get`, with `collapseThreads: true`, newest
   first, and `OffsetCursor` pages of 25. Preserve the requested id order because `Email/get` does
   not guarantee response order.
@@ -99,6 +101,9 @@ mocked `fetch`; no Fastmail credentials belong in the repository.
 - Each pending mutation is stored by action id until `applyAction()` or `rejectAction()` resolves
   it. Do not delete a pending record merely because `submitAction()` throws: the overseer may have
   committed the action even if the RPC response was lost.
+- `applyAction()` deletes the pending record only after the Fastmail call succeeds. The overseer
+  keeps an action pending when `applyAction()` throws, so a failed apply must stay approvable; an
+  in-memory in-flight set stops a concurrent second approval from applying it twice.
 - Keyword mutations set per-email simulated overlays immediately, so `messages()` reflects the
   caller's pending keyword changes. Clear an overlay only if the resolving action is still the
   latest overlay for that email.

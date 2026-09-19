@@ -15,7 +15,6 @@ import {
   type JmapEmailAddress,
   type JmapEmailObject,
   type JmapMailboxObject,
-  type JmapMethodCall,
   type JmapMethodError,
   type JmapRequestBody,
   type JmapResponseBody,
@@ -93,6 +92,41 @@ function methodErrorCode(error: JmapMethodError): FastmailError["code"] {
   }
 }
 
+function describeMethodError(error: JmapMethodError): string {
+  return `${error.type}${error.description ? ` (${error.description})` : ""}`;
+}
+
+/** Sends one JMAP request and returns its parsed body, throwing on a transport failure or an HTTP
+ * error status. Method-level errors are left for `methodResult()` to surface per call. */
+async function request(
+  apiUrl: string, apiToken: string, body: JmapRequestBody, fetchImpl: typeof fetch,
+): Promise<JmapResponseBody> {
+  const res = await fetchImpl(apiUrl, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw errorForStatus(res.status);
+
+  try {
+    return JSON.parse(await readTextCapped(res)) as JmapResponseBody;
+  } catch (error) {
+    throw new FastmailError(
+      "UPSTREAM_UNAVAILABLE", "Fastmail's JMAP response could not be parsed.", { cause: error });
+  }
+}
+
+/** Returns the result of the method call with `callId`, throwing if it came back as an `error`. */
+function methodResult(parsed: JmapResponseBody, callId: string, name: string): Record<string, unknown> {
+  const [responseName, result] = parsed.methodResponses?.find(([, , id]) => id === callId) ?? [];
+  if (responseName === "error") {
+    throw new FastmailError(
+      methodErrorCode(result as unknown as JmapMethodError),
+      `Fastmail rejected ${name}: ${describeMethodError(result as unknown as JmapMethodError)}.`);
+  }
+  return result ?? {};
+}
+
 /**
  * Sends one JMAP request with a single method call and returns its result, throwing on a
  * transport failure, an HTTP error status, or a method-level `error` response.
@@ -101,29 +135,8 @@ async function call(
   apiUrl: string, apiToken: string, using: string[], name: string, args: Record<string, unknown>,
   fetchImpl: typeof fetch,
 ): Promise<Record<string, unknown>> {
-  const body: JmapRequestBody = { using, methodCalls: [[name, args, "c1"]] };
-  const res = await fetchImpl(apiUrl, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw errorForStatus(res.status);
-
-  let parsed: JmapResponseBody;
-  try {
-    parsed = JSON.parse(await readTextCapped(res)) as JmapResponseBody;
-  } catch (error) {
-    throw new FastmailError(
-      "UPSTREAM_UNAVAILABLE", "Fastmail's JMAP response could not be parsed.", { cause: error });
-  }
-  const [responseName, result] = parsed.methodResponses[0] ?? [];
-  if (responseName === "error") {
-    const methodError = result as unknown as JmapMethodError;
-    throw new FastmailError(
-      methodErrorCode(methodError),
-      `Fastmail rejected ${name}: ${methodError.type}${methodError.description ? ` (${methodError.description})` : ""}.`);
-  }
-  return result ?? {};
+  const parsed = await request(apiUrl, apiToken, { using, methodCalls: [[name, args, "c1"]] }, fetchImpl);
+  return methodResult(parsed, "c1", name);
 }
 
 function usingFor(hasSubmission: boolean): string[] {
@@ -282,16 +295,63 @@ export type SendEmailParams = {
   subject: string;
   textBody?: string;
   htmlBody?: string;
-  draftMailboxId?: string;
+};
+
+/** The account-specific ids a send needs, resolved at apply time by `resolveSendContext()`. */
+export type SendContext = {
+  /** The Drafts mailbox the message is created in before submission. */
+  draftsMailboxId: string;
+  /** The Sent mailbox the message is moved to once submitted, when the account has one. */
+  sentMailboxId?: string;
+  /** The Identity to submit as — required by `EmailSubmission/set create` (RFC 8621 §7.5). */
+  identityId: string;
 };
 
 /**
- * Sends a message: creates a draft `Email` and an `EmailSubmission` referencing it in one JMAP
- * request, with `onSuccessDestroyEmail` cleaning up the draft once the submission succeeds — the
- * two-call sequence Fastmail's own docs describe for sending mail.
+ * Looks up the Drafts/Sent mailboxes and the sending Identity in one JMAP request. The identity is
+ * the one whose address matches `from` (case-insensitively), falling back to the account's first.
+ */
+export async function resolveSendContext(
+  apiUrl: string, apiToken: string, accountId: string, from: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<SendContext> {
+  const parsed = await request(apiUrl, apiToken, {
+    using: [JMAP_CORE_CAPABILITY, JMAP_MAIL_CAPABILITY, JMAP_SUBMISSION_CAPABILITY],
+    methodCalls: [
+      ["Mailbox/get", { accountId, properties: ["id", "role"] }, "c1"],
+      ["Identity/get", { accountId, properties: ["id", "email"] }, "c2"],
+    ],
+  }, fetchImpl);
+  const mailboxes = (methodResult(parsed, "c1", "Mailbox/get").list as
+    { id: string; role: string | null }[] | undefined) ?? [];
+  const identities = (methodResult(parsed, "c2", "Identity/get").list as
+    { id: string; email: string }[] | undefined) ?? [];
+
+  const draftsMailboxId = mailboxes.find(mailbox => mailbox.role === "drafts")?.id;
+  if (!draftsMailboxId) {
+    throw new FastmailError(
+      "RESOURCE_NOT_FOUND", "This Fastmail account has no Drafts mailbox to compose the message in.");
+  }
+  const identity = identities.find(candidate => candidate.email.toLowerCase() === from.toLowerCase())
+    ?? identities[0];
+  if (!identity) {
+    throw new FastmailError(
+      "SUBMISSION_NOT_AUTHORIZED", "This Fastmail account has no sending identity to send from.");
+  }
+  return {
+    draftsMailboxId,
+    sentMailboxId: mailboxes.find(mailbox => mailbox.role === "sent")?.id,
+    identityId: identity.id,
+  };
+}
+
+/**
+ * Sends a message: creates a draft `Email` in Drafts and an `EmailSubmission` referencing it in one
+ * JMAP request, with `onSuccessUpdateEmail` moving the message from Drafts to Sent and clearing
+ * `$draft` once the submission succeeds — the sequence Fastmail's own docs describe for sending mail.
  */
 export async function sendEmail(
-  apiUrl: string, apiToken: string, accountId: string, params: SendEmailParams,
+  apiUrl: string, apiToken: string, accountId: string, params: SendEmailParams, context: SendContext,
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ emailId: string }> {
   const bodyValues: Record<string, { value: string; charset: string }> = {};
@@ -308,14 +368,19 @@ export async function sendEmail(
 
   const draftId = "draft1";
   const submissionId = "submission1";
-  const body: JmapRequestBody = {
+  const onSuccessPatch: Record<string, unknown> = { "keywords/$draft": null };
+  if (context.sentMailboxId) {
+    onSuccessPatch[`mailboxIds/${context.draftsMailboxId}`] = null;
+    onSuccessPatch[`mailboxIds/${context.sentMailboxId}`] = true;
+  }
+  const parsed = await request(apiUrl, apiToken, {
     using: [JMAP_CORE_CAPABILITY, JMAP_MAIL_CAPABILITY, JMAP_SUBMISSION_CAPABILITY],
     methodCalls: [
       ["Email/set", {
         accountId,
         create: {
           [draftId]: {
-            mailboxIds: { [params.draftMailboxId ?? ""]: true },
+            mailboxIds: { [context.draftsMailboxId]: true },
             keywords: { "$draft": true, "$seen": true },
             from: [{ email: params.from }],
             to: params.to,
@@ -331,36 +396,24 @@ export async function sendEmail(
       ["EmailSubmission/set", {
         accountId,
         create: {
-          [submissionId]: { emailId: `#${draftId}`, identityId: undefined, onSuccessDestroyEmail: [`#${draftId}`] },
+          [submissionId]: { emailId: `#${draftId}`, identityId: context.identityId },
         },
+        onSuccessUpdateEmail: { [`#${submissionId}`]: onSuccessPatch },
       }, "c2"],
-    ] as JmapMethodCall[],
-  };
+    ],
+  }, fetchImpl);
 
-  const res = await fetchImpl(apiUrl, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw errorForStatus(res.status);
-  let parsed: JmapResponseBody;
-  try {
-    parsed = JSON.parse(await readTextCapped(res)) as JmapResponseBody;
-  } catch (error) {
-    throw new FastmailError(
-      "UPSTREAM_UNAVAILABLE", "Fastmail's send response could not be parsed.", { cause: error });
-  }
-
-  const setResult = parsed.methodResponses.find(([name]) => name === "Email/set")?.[1];
-  const created = (setResult?.created as Record<string, { id: string }> | undefined)?.[draftId];
-  const notCreated = (setResult?.notCreated as Record<string, JmapMethodError> | undefined)?.[draftId];
+  const setResult = methodResult(parsed, "c1", "Email/set");
+  const created = (setResult.created as Record<string, { id: string }> | undefined)?.[draftId];
+  const notCreated = (setResult.notCreated as Record<string, JmapMethodError> | undefined)?.[draftId];
   if (notCreated) {
-    throw new FastmailError(methodErrorCode(notCreated), `Fastmail rejected the draft: ${notCreated.type}.`);
+    throw new FastmailError(
+      methodErrorCode(notCreated), `Fastmail rejected the draft: ${describeMethodError(notCreated)}.`);
   }
 
-  const submissionResult = parsed.methodResponses.find(([name]) => name === "EmailSubmission/set")?.[1];
+  const submissionResult = methodResult(parsed, "c2", "EmailSubmission/set");
   const submissionFailure =
-    (submissionResult?.notCreated as Record<string, JmapMethodError> | undefined)?.[submissionId];
+    (submissionResult.notCreated as Record<string, JmapMethodError> | undefined)?.[submissionId];
   if (submissionFailure) {
     if (submissionFailure.type === "forbidden") {
       throw new FastmailError(
@@ -369,7 +422,8 @@ export async function sendEmail(
         "Create a new token with the Email submission scope to enable sending.");
     }
     throw new FastmailError(
-      methodErrorCode(submissionFailure), `Fastmail rejected sending: ${submissionFailure.type}.`);
+      methodErrorCode(submissionFailure),
+      `Fastmail rejected sending: ${describeMethodError(submissionFailure)}.`);
   }
 
   if (!created) {

@@ -43,6 +43,7 @@ import {
   putCachedFolders,
   setPendingAction,
   setSimulatedKeywords,
+  type PendingAction,
 } from "./cache";
 import { FastmailError } from "./errors";
 import {
@@ -53,6 +54,7 @@ import {
   getThreadMetadata,
   listMailboxes,
   queryThreadPage,
+  resolveSendContext,
   sendEmail,
   updateEmails,
   type FastmailAccountInfo,
@@ -92,6 +94,21 @@ const FASTMAIL_LOGO_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 
 <path d="M3.5 5.5 12 13l8.5-7.5" fill="none" stroke="#0067b9" stroke-width="1.5"/>\
 </svg>`;
 const FASTMAIL_LOGO_URL = `data:image/svg+xml;utf8,${encodeURIComponent(FASTMAIL_LOGO_SVG)}`;
+
+// TEMPORARY: diagnostics for "Unknown pending Fastmail action" on send approvals. Grep
+// `wrangler tail` output for "fastmail.debug". Remove once the root cause is fixed.
+function debugLog(event: string, fields: Record<string, unknown>): void {
+  console.log(JSON.stringify({ tag: "fastmail.debug", event, ...fields }));
+}
+
+function pendingActionKeys(kv: DurableObjectStorage["kv"]): string[] {
+  const keys: string[] = [];
+  for (const [key] of kv.list({ prefix: "action:pending:" })) {
+    keys.push(key);
+    if (keys.length >= 20) break;
+  }
+  return keys;
+}
 
 function errorMessage(error: unknown): string {
   if (error instanceof FastmailError) return error.message;
@@ -585,25 +602,83 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<FastmailSession> {
-    return new FastmailSessionImpl(approvalQueue.dup(), this.#userAccount(), this.ctx.storage.kv);
+    const facetId = this.ctx.id.toString();
+    debugLog("startSession", {
+      facetId, userObjectId: this.ctx.props.userObjectId,
+      nextId: this.ctx.storage.kv.get<number>("action:nextId"),
+    });
+    return new FastmailSessionImpl(approvalQueue.dup(), this.#userAccount(), this.ctx.storage.kv, facetId);
   }
 
+  #debugResolve(event: "apply" | "reject", actionId: number, pending: PendingAction | undefined): void {
+    debugLog(event, {
+      facetId: this.ctx.id.toString(), userObjectId: this.ctx.props.userObjectId, actionId,
+      nextId: this.ctx.storage.kv.get<number>("action:nextId"),
+      pendingKeys: pendingActionKeys(this.ctx.storage.kv), found: !!pending, kind: pending?.kind,
+    });
+  }
+
+  /** Action ids whose `applyAction()` is awaiting Fastmail in this instance. The input gate is open
+   * across those awaits, so without this a second concurrent approval could apply the same record
+   * twice now that it is only deleted once the side effect succeeds. */
+  #applying = new Set<number>();
+
   /** Approved: perform the deferred side effect (a thread patch or a queued send), then clear any
-   * simulation overlay a patch was showing. */
+   * simulation overlay a patch was showing.
+   *
+   * The pending record is deleted only once the side effect succeeds: the overseer leaves an action
+   * pending when this throws, so a failed attempt (bad token, Fastmail rejecting the request) stays
+   * approvable once the cause is fixed. A send whose response is lost after Fastmail accepted it
+   * could therefore be sent again on retry — JMAP offers no idempotency key to prevent that. */
   async applyAction(actionId: number): Promise<void> {
     const pending = getPendingAction(this.ctx.storage.kv, actionId);
-    if (!pending) throw new Error(`Unknown pending Fastmail action: ${actionId}`);
-    deletePendingAction(this.ctx.storage.kv, actionId);
-
-    const grant = await this.#userAccount().getGrant();
-    if (pending.kind === "send") {
-      await sendEmail(grant.apiUrl, grant.apiToken, grant.accountId, pending.params);
-      return;
+    this.#debugResolve("apply", actionId, pending);
+    if (!pending) {
+      throw new Error(
+        `Unknown pending Fastmail action: ${actionId} (facet ${this.ctx.id.toString()}, pending: ` +
+        `${JSON.stringify(pendingActionKeys(this.ctx.storage.kv))})`);
     }
-    await updateEmails(
-      grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, pending.emailIds, pending.patch);
-    for (const emailId of pending.emailIds) {
-      clearSimulatedKeywordsIfLatest(this.ctx.storage.kv, emailId, actionId);
+    if (this.#applying.has(actionId)) {
+      throw new Error(`Fastmail action ${actionId} is already being applied.`);
+    }
+    this.#applying.add(actionId);
+    try {
+      const grant = await this.#userAccount().getGrant();
+      await this.#call(async () => {
+        if (pending.kind === "send") {
+          const context = await resolveSendContext(
+            grant.apiUrl, grant.apiToken, grant.accountId, pending.params.from);
+          await sendEmail(grant.apiUrl, grant.apiToken, grant.accountId, pending.params, context);
+        } else {
+          await updateEmails(
+            grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, pending.emailIds,
+            pending.patch);
+        }
+      });
+    } finally {
+      this.#applying.delete(actionId);
+    }
+
+    deletePendingAction(this.ctx.storage.kv, actionId);
+    if (pending.kind === "patch") {
+      for (const emailId of pending.emailIds) {
+        clearSimulatedKeywordsIfLatest(this.ctx.storage.kv, emailId, actionId);
+      }
+    }
+  }
+
+  async #call<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn();
+    } catch (error) {
+      if (error instanceof FastmailError && error.code === "AUTH_EXPIRED") {
+        await this.#userAccount().noteCredentialsExpired();
+        throw new Error(
+          "Fastmail's API token has expired or been revoked. Please reconnect the account, then " +
+          "approve this action again.",
+          { cause: error });
+      }
+      throw error;
     }
   }
 
@@ -611,6 +686,7 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
    * to Fastmail. */
   async rejectAction(actionId: number): Promise<void> {
     const pending = getPendingAction(this.ctx.storage.kv, actionId);
+    this.#debugResolve("reject", actionId, pending);
     deletePendingAction(this.ctx.storage.kv, actionId);
     if (pending?.kind !== "patch") return;
     for (const emailId of pending.emailIds) {
@@ -650,14 +726,16 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
   #approvalQueue: RpcStub<ApprovalQueue>;
   #account: DurableObjectStub<UserAccount>;
   #kv: DurableObjectStorage["kv"];
+  #facetId: string;
 
   constructor(
       approvalQueue: RpcStub<ApprovalQueue>, account: DurableObjectStub<UserAccount>,
-      kv: DurableObjectStorage["kv"]) {
+      kv: DurableObjectStorage["kv"], facetId: string) {
     super();
     this.#approvalQueue = approvalQueue;
     this.#account = account;
     this.#kv = kv;
+    this.#facetId = facetId;
   }
 
   [Symbol.dispose]() {
@@ -735,7 +813,8 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
     const grant = await this.#account.getGrant();
     const metadata = await this.#call(() =>
       getThreadMetadata(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, threadId));
-    return new FastmailThreadImpl(this.#approvalQueue.dup(), this.#account, this.#kv, metadata.messageIds);
+    return new FastmailThreadImpl(
+      this.#approvalQueue.dup(), this.#account, this.#kv, this.#facetId, metadata.messageIds);
   }
 
   async send(
@@ -773,11 +852,22 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
     // Deleting the pending record here would then permanently orphan an action the overseer still
     // considers pending and approvable — applyAction() would find nothing when it's later approved.
     // An orphaned record from a genuine pre-commit rejection is harmless (never referenced again).
-    await this.#approvalQueue.submitAction(actionId, {
-      title: "Send email",
-      description: `Send "${subject}" to ${to.map(address => address.email).join(", ")}.`,
-      // Sending is irreversible: EmailSubmission has no "unsend".
-      implementsRevert: false,
+    debugLog("send.staged", {
+      facetId: this.#facetId, actionId, hasRecord: !!getPendingAction(this.#kv, actionId),
+    });
+    try {
+      await this.#approvalQueue.submitAction(actionId, {
+        title: "Send email",
+        description: `Send "${subject}" to ${to.map(address => address.email).join(", ")}.`,
+        // Sending is irreversible: EmailSubmission has no "unsend".
+        implementsRevert: false,
+      });
+    } catch (error) {
+      debugLog("send.submitFailed", { facetId: this.#facetId, actionId, error: errorMessage(error) });
+      throw error;
+    }
+    debugLog("send.submitted", {
+      facetId: this.#facetId, actionId, hasRecord: !!getPendingAction(this.#kv, actionId),
     });
   }
 
@@ -796,15 +886,17 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
   #approvalQueue: RpcStub<ApprovalQueue>;
   #account: DurableObjectStub<UserAccount>;
   #kv: DurableObjectStorage["kv"];
+  #facetId: string;
   #messageIds: string[];
 
   constructor(
       approvalQueue: RpcStub<ApprovalQueue>, account: DurableObjectStub<UserAccount>,
-      kv: DurableObjectStorage["kv"], messageIds: string[]) {
+      kv: DurableObjectStorage["kv"], facetId: string, messageIds: string[]) {
     super();
     this.#approvalQueue = approvalQueue;
     this.#account = account;
     this.#kv = kv;
+    this.#facetId = facetId;
     this.#messageIds = messageIds;
   }
 
@@ -868,7 +960,11 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
     // Not cleaned up on a thrown error — see the matching comment in FastmailSessionImpl.send():
     // the overseer commits the action record before submitAction() returns, so deleting the local
     // record on a failed await could orphan a genuinely-pending, still-approvable action.
+    debugLog("patch.staged", {
+      facetId: this.#facetId, actionId, hasRecord: !!getPendingAction(this.#kv, actionId),
+    });
     await this.#approvalQueue.submitAction(actionId, { title, description, implementsRevert: false });
+    debugLog("patch.submitted", { facetId: this.#facetId, actionId });
   }
 
   async moveToFolder(folderId: string): Promise<void> {
@@ -892,12 +988,16 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
     // before submitAction() returns, so a failure reaching this await can mean the submission
     // actually succeeded server-side. Clearing either here could desync this session's view (or
     // orphan a still-approvable action) from what the overseer actually recorded.
+    debugLog("patch.staged", {
+      facetId: this.#facetId, actionId, hasRecord: !!getPendingAction(this.#kv, actionId),
+    });
     await this.#approvalQueue.submitAction(actionId, {
       title,
       description: `${present ? "Add" : "Remove"} the "${keyword}" keyword on this thread's ` +
         `${this.#messageIds.length} message(s).`,
       implementsRevert: false,
     });
+    debugLog("patch.submitted", { facetId: this.#facetId, actionId });
   }
 
   async addKeyword(keyword: string): Promise<void> {

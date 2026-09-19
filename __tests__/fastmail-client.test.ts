@@ -5,6 +5,7 @@ import {
   fetchIdentityEmail,
   listMailboxes,
   queryThreadPage,
+  resolveSendContext,
   sendEmail,
   updateEmails,
 } from "../src/fastmail-api";
@@ -127,6 +128,12 @@ describe("updateEmails", () => {
   });
 });
 
+const SEND_CONTEXT = { draftsMailboxId: "mb-drafts", sentMailboxId: "mb-sent", identityId: "id1" };
+
+function requestBody(fetchImpl: ReturnType<typeof vi.fn>): any {
+  return JSON.parse((fetchImpl.mock.calls[0] as unknown as [string, RequestInit])[1].body as string);
+}
+
 describe("sendEmail", () => {
   it("returns the created draft's id on success", async () => {
     const fetchImpl = vi.fn(async () => jsonResponse({
@@ -137,8 +144,46 @@ describe("sendEmail", () => {
     }));
     const result = await sendEmail("https://api/", "token", "u1", {
       from: "me@fastmail.com", to: [{ email: "you@example.com" }], subject: "Hi", textBody: "Hello",
-    }, fetchImpl);
+    }, SEND_CONTEXT, fetchImpl);
     expect(result).toEqual({ emailId: "msg1" });
+  });
+
+  it("creates the draft in Drafts, submits with an identity, and moves it to Sent", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [
+        ["Email/set", { created: { draft1: { id: "msg1" } } }, "c1"],
+        ["EmailSubmission/set", { created: { submission1: { id: "sub1" } } }, "c2"],
+      ],
+    }));
+    await sendEmail("https://api/", "token", "u1", {
+      from: "me@fastmail.com", to: [{ email: "you@example.com" }], subject: "Hi", textBody: "Hello",
+    }, SEND_CONTEXT, fetchImpl);
+
+    const [[, emailSet], [, submissionSet]] = requestBody(fetchImpl).methodCalls;
+    expect(emailSet.create.draft1.mailboxIds).toEqual({ "mb-drafts": true });
+    expect(submissionSet.create.submission1).toEqual({ emailId: "#draft1", identityId: "id1" });
+    expect(submissionSet.onSuccessUpdateEmail).toEqual({
+      "#submission1": {
+        "keywords/$draft": null,
+        "mailboxIds/mb-drafts": null,
+        "mailboxIds/mb-sent": true,
+      },
+    });
+    expect(submissionSet.onSuccessDestroyEmail).toBeUndefined();
+  });
+
+  it("only clears $draft when the account has no Sent mailbox", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [
+        ["Email/set", { created: { draft1: { id: "msg1" } } }, "c1"],
+        ["EmailSubmission/set", { created: { submission1: { id: "sub1" } } }, "c2"],
+      ],
+    }));
+    await sendEmail("https://api/", "token", "u1", {
+      from: "me@fastmail.com", to: [{ email: "you@example.com" }], subject: "Hi",
+    }, { draftsMailboxId: "mb-drafts", identityId: "id1" }, fetchImpl);
+    const [, [, submissionSet]] = requestBody(fetchImpl).methodCalls;
+    expect(submissionSet.onSuccessUpdateEmail).toEqual({ "#submission1": { "keywords/$draft": null } });
   });
 
   it("throws SUBMISSION_NOT_AUTHORIZED when the token lacks submission scope", async () => {
@@ -150,7 +195,59 @@ describe("sendEmail", () => {
     }));
     await expect(sendEmail("https://api/", "token", "u1", {
       from: "me@fastmail.com", to: [{ email: "you@example.com" }], subject: "Hi",
-    }, fetchImpl)).rejects.toMatchObject({ code: "SUBMISSION_NOT_AUTHORIZED" });
+    }, SEND_CONTEXT, fetchImpl)).rejects.toMatchObject({ code: "SUBMISSION_NOT_AUTHORIZED" });
+  });
+
+  it("throws on a method-level error response", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [
+        ["error", { type: "invalidArguments", description: "bad create" }, "c1"],
+        ["error", { type: "invalidResultReference" }, "c2"],
+      ],
+    }));
+    await expect(sendEmail("https://api/", "token", "u1", {
+      from: "me@fastmail.com", to: [{ email: "you@example.com" }], subject: "Hi",
+    }, SEND_CONTEXT, fetchImpl)).rejects.toMatchObject({
+      code: "INVALID_RESOURCE", message: expect.stringContaining("bad create"),
+    });
+  });
+});
+
+describe("resolveSendContext", () => {
+  function contextResponse(identities: { id: string; email: string }[], roles = ["inbox", "drafts", "sent"]) {
+    return vi.fn(async () => jsonResponse({
+      methodResponses: [
+        ["Mailbox/get", { list: roles.map(role => ({ id: `mb-${role}`, role })) }, "c1"],
+        ["Identity/get", { list: identities }, "c2"],
+      ],
+    }));
+  }
+
+  it("resolves Drafts, Sent, and the identity matching the sender", async () => {
+    const fetchImpl = contextResponse([
+      { id: "id-other", email: "alias@example.com" },
+      { id: "id-me", email: "Me@Fastmail.com" },
+    ]);
+    await expect(resolveSendContext("https://api/", "token", "u1", "me@fastmail.com", fetchImpl))
+      .resolves.toEqual({ draftsMailboxId: "mb-drafts", sentMailboxId: "mb-sent", identityId: "id-me" });
+  });
+
+  it("falls back to the first identity when none matches", async () => {
+    const fetchImpl = contextResponse([{ id: "id-first", email: "alias@example.com" }]);
+    await expect(resolveSendContext("https://api/", "token", "u1", "me@fastmail.com", fetchImpl))
+      .resolves.toMatchObject({ identityId: "id-first" });
+  });
+
+  it("throws when the account has no Drafts mailbox", async () => {
+    const fetchImpl = contextResponse([{ id: "id-me", email: "me@fastmail.com" }], ["inbox"]);
+    await expect(resolveSendContext("https://api/", "token", "u1", "me@fastmail.com", fetchImpl))
+      .rejects.toMatchObject({ code: "RESOURCE_NOT_FOUND" });
+  });
+
+  it("throws when the account has no identity", async () => {
+    const fetchImpl = contextResponse([]);
+    await expect(resolveSendContext("https://api/", "token", "u1", "me@fastmail.com", fetchImpl))
+      .rejects.toMatchObject({ code: "SUBMISSION_NOT_AUTHORIZED" });
   });
 });
 
