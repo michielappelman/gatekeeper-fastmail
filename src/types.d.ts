@@ -47,6 +47,14 @@ export type FastmailAttachment = {
   blobId: string;
 };
 
+/** Result of converting an attachment's content to Markdown. */
+export type FastmailMarkdownContent = {
+  /** The converted content. */
+  markdown: string;
+  /** The MIME type the original content was converted from. */
+  sourceMimeType: string;
+};
+
 /** One message within a thread. */
 export type FastmailMessage = {
   id: string;
@@ -147,6 +155,16 @@ export interface FastmailThread {
 
   /** Downloads one attachment's content, by the `blobId` from `FastmailMessage.attachments`. */
   readAttachment(blobId: string): Promise<ArrayBuffer>;
+
+  /**
+   * Downloads one attachment's content and converts it to Markdown -- HTML, PDF, and common
+   * office/document formats (Word, Excel, OpenDocument, Apple Numbers) become readable text. See
+   * `readAttachment()` for how `blobId` is resolved. Throws with code `UNSUPPORTED_FOR_MARKDOWN`
+   * if the attachment's `mimeType` cannot be converted, or `TOO_LARGE_FOR_MARKDOWN` if it is too
+   * large -- check `FastmailMessage.attachments` first, or call `readAttachment()` instead, if
+   * either is a possibility.
+   */
+  readAttachmentAsMarkdown(blobId: string): Promise<FastmailMarkdownContent>;
 
   /**
    * Moves every message in this thread into `folderId` (from `FastmailFolder.id`). Use

@@ -8,6 +8,9 @@
   },
   "compatibility_date": "2026-08-04",
   "compatibility_flags": ["allow_irrevocable_stub_storage", "nodejs_compat"],
+  // What readAttachmentAsMarkdown()'s conversion runs on (env.WORKERS_AI.toMarkdown()), the same
+  // mechanism the Workshop's webFetch agent tool uses.
+  "ai": { "binding": "WORKERS_AI" },
   "migrations": [
     {
       "tag": "v0",

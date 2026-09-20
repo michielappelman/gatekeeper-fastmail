@@ -4,6 +4,7 @@
 interface __BaseEnv_Env {
 	CUSTOM_NAME: "Example organization";
 	CUSTOM_MESSAGE: "Replace this with information useful to your organization.";
+	WORKERS_AI: Ai;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {

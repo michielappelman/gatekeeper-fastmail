@@ -36,15 +36,18 @@ import { OffsetCursor } from "@gadgets/gatekeeper-kit/cursors";
 import {
   clearSimulatedKeywordsIfLatest,
   deletePendingAction,
+  getCachedAttachmentMarkdown,
   getCachedFolders,
   getPendingAction,
   getSimulatedKeywords,
   mergeSimulatedKeywords,
+  putCachedAttachmentMarkdown,
   putCachedFolders,
   setPendingAction,
   setSimulatedKeywords,
 } from "./cache";
 import { FastmailError } from "./errors";
+import { assertMarkdownConvertible, convertToMarkdown } from "./markdown";
 import {
   downloadBlob,
   fetchAccountInfo,
@@ -68,6 +71,7 @@ import type {
   FastmailAddress,
   FastmailAttachment,
   FastmailFolder,
+  FastmailMarkdownContent,
   FastmailMessage,
   FastmailSession,
   FastmailThread,
@@ -598,7 +602,8 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<FastmailSession> {
-    return new FastmailSessionImpl(approvalQueue.dup(), this.#userAccount(), this.ctx.storage.kv);
+    return new FastmailSessionImpl(
+      approvalQueue.dup(), this.#userAccount(), this.ctx.storage.kv, this.env.WORKERS_AI);
   }
 
   /** Action ids whose `applyAction()` is awaiting Fastmail in this instance. The input gate is open
@@ -774,14 +779,16 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
   #approvalQueue: RpcStub<ApprovalQueue>;
   #account: DurableObjectStub<UserAccount>;
   #kv: DurableObjectStorage["kv"];
+  #ai: Ai;
 
   constructor(
       approvalQueue: RpcStub<ApprovalQueue>, account: DurableObjectStub<UserAccount>,
-      kv: DurableObjectStorage["kv"]) {
+      kv: DurableObjectStorage["kv"], ai: Ai) {
     super();
     this.#approvalQueue = approvalQueue;
     this.#account = account;
     this.#kv = kv;
+    this.#ai = ai;
   }
 
   [Symbol.dispose]() {
@@ -860,7 +867,8 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
     const grant = await this.#account.getGrant();
     const metadata = await this.#call(() =>
       getThreadMetadata(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, threadId));
-    return new FastmailThreadImpl(this.#approvalQueue.dup(), this.#account, this.#kv, metadata.messageIds);
+    return new FastmailThreadImpl(
+      this.#approvalQueue.dup(), this.#account, this.#kv, metadata.messageIds, this.#ai);
   }
 
   async send(
@@ -892,15 +900,17 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
   #account: DurableObjectStub<UserAccount>;
   #kv: DurableObjectStorage["kv"];
   #messageIds: string[];
+  #ai: Ai;
 
   constructor(
       approvalQueue: RpcStub<ApprovalQueue>, account: DurableObjectStub<UserAccount>,
-      kv: DurableObjectStorage["kv"], messageIds: string[]) {
+      kv: DurableObjectStorage["kv"], messageIds: string[], ai: Ai) {
     super();
     this.#approvalQueue = approvalQueue;
     this.#account = account;
     this.#kv = kv;
     this.#messageIds = messageIds;
+    this.#ai = ai;
   }
 
   [Symbol.dispose]() {
@@ -984,6 +994,45 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
       description: `Downloaded ${attachment.name ?? blobId} (${content.byteLength} bytes).`,
     });
     return content;
+  }
+
+  /**
+   * Reuses `readAttachment()`'s attachment lookup (still required on every call, cache hit or not
+   * -- it's what confirms `blobId` actually belongs to a message in this thread, not just any blob
+   * in the account). A `blobId`'s content is immutable, so a cache hit skips both the download and
+   * the conversion.
+   */
+  async readAttachmentAsMarkdown(blobId: string): Promise<FastmailMarkdownContent> {
+    const grant = await this.#account.getGrant();
+    const emails = await this.#call(() => getMessages(
+      grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, this.#messageIds));
+    const attachment = emails.flatMap(email => email.attachments ?? []).find(a => a.blobId === blobId);
+    if (!attachment) {
+      throw new FastmailError(
+        "RESOURCE_NOT_FOUND", "That attachment does not belong to a message in this thread.");
+    }
+    assertMarkdownConvertible(attachment.type, attachment.size);
+
+    const cached = getCachedAttachmentMarkdown(this.#kv, blobId);
+    if (cached) {
+      await this.#approvalQueue.authorizeObservation({
+        title: "Download Fastmail attachment as Markdown",
+        description: `Converted ${attachment.name ?? blobId} to Markdown (cached).`,
+      });
+      return cached;
+    }
+
+    const content = await this.#call(() => downloadBlob(
+      grant.downloadUrlTemplate, grant.apiToken, grant.accountId, blobId,
+      attachment.name ?? "attachment", attachment.type));
+    const markdown = await convertToMarkdown(this.#ai, attachment.name ?? blobId, attachment.type, content);
+    const result: FastmailMarkdownContent = { markdown, sourceMimeType: attachment.type };
+    putCachedAttachmentMarkdown(this.#kv, blobId, result);
+    await this.#approvalQueue.authorizeObservation({
+      title: "Download Fastmail attachment as Markdown",
+      description: `Converted ${attachment.name ?? blobId} to Markdown (${content.byteLength} bytes source).`,
+    });
+    return result;
   }
 
   async #submitPatch(title: string, description: string, patch: Record<string, unknown>): Promise<void> {

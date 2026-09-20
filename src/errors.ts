@@ -10,7 +10,10 @@ export type FastmailErrorCode =
   | "RESOURCE_NOT_FOUND"
   | "INVALID_RESOURCE"
   | "RATE_LIMITED"
-  | "UPSTREAM_UNAVAILABLE";
+  | "UPSTREAM_UNAVAILABLE"
+  | "UNSUPPORTED_FOR_MARKDOWN"
+  | "TOO_LARGE_FOR_MARKDOWN"
+  | "MARKDOWN_CONVERSION_FAILED";
 
 export class FastmailError extends Error {
   constructor(readonly code: FastmailErrorCode, message: string, options?: { cause?: unknown }) {

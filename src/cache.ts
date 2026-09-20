@@ -44,6 +44,31 @@ export function putCachedFolders(kv: CacheKv, folders: JmapMailboxObject[], now:
   kv.put<CachedFolders>(FOLDERS_KEY, { folders, fetchedAt: now });
 }
 
+/** Converted Markdown above this length (in UTF-16 code units) is not cached. */
+export const ATTACHMENT_MARKDOWN_MAX_CHARS = 2_000_000;
+
+type CachedAttachmentMarkdown = { markdown: string; sourceMimeType: string };
+
+function attachmentMarkdownKey(blobId: string): string {
+  return `cache:markdown:${blobId}`;
+}
+
+/**
+ * A `blobId`'s content never changes (unlike a Jottacloud file's `md5`-keyed cache), so this has
+ * no TTL -- only the size cap `putCachedAttachmentMarkdown` applies, for the same reason
+ * `putCachedContent`-style caches elsewhere withhold oversized values.
+ */
+export function getCachedAttachmentMarkdown(kv: CacheKv, blobId: string): CachedAttachmentMarkdown | undefined {
+  return kv.get<CachedAttachmentMarkdown>(attachmentMarkdownKey(blobId));
+}
+
+export function putCachedAttachmentMarkdown(
+  kv: CacheKv, blobId: string, value: CachedAttachmentMarkdown,
+): void {
+  if (value.markdown.length > ATTACHMENT_MARKDOWN_MAX_CHARS) return;
+  kv.put<CachedAttachmentMarkdown>(attachmentMarkdownKey(blobId), value);
+}
+
 /**
  * A deferred, not-yet-approved side effect. Either a JMAP `Email/set update` patch applied to every
  * message id in a thread (`moveToFolder`/`addKeyword`/`removeKeyword`/`markRead`/`markUnread`), or a
