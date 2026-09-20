@@ -23,9 +23,12 @@ export const MARKDOWN_CONVERTIBLE_MIME_TYPES = new Set([
   "application/vnd.apple.numbers",                                           // .numbers
 ]);
 
-/** Content above this size is rejected before it is downloaded or sent for conversion, as a proxy
- * for what a Worker's CPU/wall-time budget can reasonably convert in one request. */
-export const MARKDOWN_CONVERT_MAX_BYTES = 1_000_000;
+/** Content above this size is rejected before it is downloaded or sent for conversion. Cloudflare
+ * documents no hard byte-size limit for `toMarkdown()` itself (it parses PDFs page-by-page on its
+ * own side), and this call is I/O-bound for this Worker rather than CPU-bound, so this exists as a
+ * sane ceiling rather than a workaround for a known constraint -- sized to comfortably cover
+ * real-world PDFs (a few MB, up to ~10MB) with headroom. */
+export const MARKDOWN_CONVERT_MAX_BYTES = 10 * 1024 * 1024; // 10 MiB
 
 /**
  * Throws `UNSUPPORTED_FOR_MARKDOWN`/`TOO_LARGE_FOR_MARKDOWN` before any content is downloaded or
