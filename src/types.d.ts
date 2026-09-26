@@ -118,7 +118,8 @@ export interface FastmailSession {
    * actually left the account, and there is no way to learn the resulting message's id from this
    * call. Throws with code `SUBMISSION_NOT_AUTHORIZED` if the connected account's API token was not
    * granted Email submission scope — check for that before calling if you need to handle it
-   * gracefully, since not every connected token can send.
+   * gracefully, since not every connected token can send. Passing only `text` (no `html`) still
+   * sends a normally-formatted message: a simple HTML version is derived from it automatically.
    */
   send(
     to: FastmailAddress[],
@@ -141,6 +142,8 @@ export interface FastmailThread {
    * the original's other To/Cc recipients (never your own address). Like `send()`, this resolves
    * once the reply is queued for approval, and throws `SUBMISSION_NOT_AUTHORIZED` if the token
    * cannot send. Prefer this over `send()` whenever you are answering an existing message.
+   * Passing only `text` (no `html`) still sends a normally-formatted message: a simple HTML
+   * version is derived from it automatically.
    *
    * @example
    * ```ts

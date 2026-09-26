@@ -7,6 +7,7 @@
  */
 
 import { errorForStatus, FastmailError } from "./errors";
+import { escapeHtml } from "@gadgets/gatekeeper-kit/connect-pages";
 import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
 import {
   JMAP_CORE_CAPABILITY,
@@ -397,6 +398,19 @@ export async function resolveSendContext(
 }
 
 /**
+ * Derives a simple HTML alternative from plain text, so a message sent with only `textBody` still
+ * renders with normal paragraph spacing in a proportional font instead of a mail client's bland
+ * monospace plain-text view. A blank line starts a new paragraph; a single line break within a
+ * paragraph becomes `<br>`, preserving line-wrapped structure like a manual bullet list.
+ */
+export function textToHtml(text: string): string {
+  const paragraphs = text.split(/\n{2,}/).map(paragraph => escapeHtml(paragraph).replace(/\n/g, "<br>"));
+  const body = paragraphs.map(paragraph => `<p>${paragraph}</p>`).join("\n");
+  return `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, ` +
+    `Arial, sans-serif; font-size: 14px; line-height: 1.5;">\n${body}\n</div>`;
+}
+
+/**
  * Sends a message: creates a draft `Email` in Drafts and an `EmailSubmission` referencing it in one
  * JMAP request, with `onSuccessUpdateEmail` moving the message from Drafts to Sent and clearing
  * `$draft` once the submission succeeds — the sequence Fastmail's own docs describe for sending mail.
@@ -405,15 +419,18 @@ export async function sendEmail(
   apiUrl: string, apiToken: string, accountId: string, params: SendEmailParams, context: SendContext,
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ emailId: string }> {
-  const bodyValues: Record<string, { value: string; charset: string }> = {};
+  const bodyValues: Record<string, { value: string }> = {};
   const textBody: { partId: string; type: string }[] = [];
   const htmlBody: { partId: string; type: string }[] = [];
   if (params.textBody !== undefined) {
-    bodyValues.text = { value: params.textBody, charset: "utf-8" };
+    bodyValues.text = { value: params.textBody };
     textBody.push({ partId: "text", type: "text/plain" });
   }
-  if (params.htmlBody !== undefined) {
-    bodyValues.html = { value: params.htmlBody, charset: "utf-8" };
+  // Falls back to a derived HTML alternative when only textBody was given, so a plain
+  // `{ text: "..." }` send (the common case) doesn't ship without any text/html part at all.
+  const html = params.htmlBody ?? (params.textBody !== undefined ? textToHtml(params.textBody) : undefined);
+  if (html !== undefined) {
+    bodyValues.html = { value: html };
     htmlBody.push({ partId: "html", type: "text/html" });
   }
 

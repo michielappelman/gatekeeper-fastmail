@@ -9,6 +9,7 @@ import {
   replyRecipients,
   resolveSendContext,
   sendEmail,
+  textToHtml,
   updateEmails,
 } from "../src/fastmail-api";
 
@@ -130,6 +131,32 @@ describe("updateEmails", () => {
   });
 });
 
+describe("textToHtml", () => {
+  it("wraps a single line in one paragraph", () => {
+    expect(textToHtml("Hello there")).toContain("<p>Hello there</p>");
+  });
+
+  it("splits blank-line-separated text into separate paragraphs", () => {
+    const html = textToHtml("First paragraph.\n\nSecond paragraph.");
+    expect(html).toContain("<p>First paragraph.</p>");
+    expect(html).toContain("<p>Second paragraph.</p>");
+  });
+
+  it("turns a single line break within a paragraph into <br>, preserving line-wrapped structure", () => {
+    const html = textToHtml("- item one\n- item two");
+    expect(html).toContain("<p>- item one<br>- item two</p>");
+  });
+
+  it("escapes HTML special characters", () => {
+    const html = textToHtml("Tom & Jerry <script>alert(1)</script>");
+    expect(html).toContain("Tom &amp; Jerry &lt;script&gt;alert(1)&lt;/script&gt;");
+  });
+
+  it("preserves accented characters and currency symbols unmodified", () => {
+    expect(textToHtml("véén dag, € 112,50")).toContain("véén dag, € 112,50");
+  });
+});
+
 const SEND_CONTEXT = { draftsMailboxId: "mb-drafts", sentMailboxId: "mb-sent", identityId: "id1" };
 
 function requestBody(fetchImpl: ReturnType<typeof vi.fn>): any {
@@ -198,6 +225,57 @@ describe("sendEmail", () => {
     await expect(sendEmail("https://api/", "token", "u1", {
       from: "me@fastmail.com", to: [{ email: "you@example.com" }], subject: "Hi",
     }, SEND_CONTEXT, fetchImpl)).rejects.toMatchObject({ code: "SUBMISSION_NOT_AUTHORIZED" });
+  });
+
+  it("derives an html body when only textBody is given", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [
+        ["Email/set", { created: { draft1: { id: "msg1" } } }, "c1"],
+        ["EmailSubmission/set", { created: { submission1: { id: "sub1" } } }, "c2"],
+      ],
+    }));
+    await sendEmail("https://api/", "token", "u1", {
+      from: "me@fastmail.com", to: [{ email: "you@example.com" }], subject: "Hi", textBody: "Hello",
+    }, SEND_CONTEXT, fetchImpl);
+
+    const [[, emailSet]] = requestBody(fetchImpl).methodCalls;
+    const draft = emailSet.create.draft1;
+    expect(draft.bodyValues.text).toEqual({ value: "Hello" });
+    expect(draft.bodyValues.html.value).toContain("<p>Hello</p>");
+    expect(draft.textBody).toEqual([{ partId: "text", type: "text/plain" }]);
+    expect(draft.htmlBody).toEqual([{ partId: "html", type: "text/html" }]);
+  });
+
+  it("does not derive an html body when neither textBody nor htmlBody is given", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [
+        ["Email/set", { created: { draft1: { id: "msg1" } } }, "c1"],
+        ["EmailSubmission/set", { created: { submission1: { id: "sub1" } } }, "c2"],
+      ],
+    }));
+    await sendEmail("https://api/", "token", "u1", {
+      from: "me@fastmail.com", to: [{ email: "you@example.com" }], subject: "Hi",
+    }, SEND_CONTEXT, fetchImpl);
+
+    const [[, emailSet]] = requestBody(fetchImpl).methodCalls;
+    expect(emailSet.create.draft1.htmlBody).toBeUndefined();
+    expect(emailSet.create.draft1.bodyValues.html).toBeUndefined();
+  });
+
+  it("passes an explicit htmlBody through unchanged rather than deriving one", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [
+        ["Email/set", { created: { draft1: { id: "msg1" } } }, "c1"],
+        ["EmailSubmission/set", { created: { submission1: { id: "sub1" } } }, "c2"],
+      ],
+    }));
+    await sendEmail("https://api/", "token", "u1", {
+      from: "me@fastmail.com", to: [{ email: "you@example.com" }], subject: "Hi",
+      textBody: "Hello", htmlBody: "<strong>Hello</strong>",
+    }, SEND_CONTEXT, fetchImpl);
+
+    const [[, emailSet]] = requestBody(fetchImpl).methodCalls;
+    expect(emailSet.create.draft1.bodyValues.html).toEqual({ value: "<strong>Hello</strong>" });
   });
 
   it("throws on a method-level error response", async () => {
