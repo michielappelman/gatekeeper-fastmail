@@ -104,6 +104,12 @@ actually reaches Fastmail once `FastmailGatekeeperImpl.applyAction()` is called 
 state so `FastmailThread.messages()` reflects the caller's own not-yet-approved edit immediately
 (`cache.ts`); a queued `send()` has nothing to simulate.
 
+The approval shows exactly what is sent (`src/approval.ts`, built with gatekeeper-kit's
+`ActionDescriptionBuilder`): From, To, Cc, Bcc, Subject, a reply's In-Reply-To and References,
+the full plain-text body, and the HTML body, including the one derived from the plain text when the
+agent gave none. Such a description is marked complete. A thread change lists the messages it
+touches (date, sender, subject) and the target folder or keyword.
+
 ## Observers
 
 Strategy A (private-only, see `write-gatekeeper` skill "Observer verification"): a personal mailbox

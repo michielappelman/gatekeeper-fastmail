@@ -33,6 +33,7 @@ import {
   type TimedNonce,
 } from "@gadgets/gatekeeper-kit/connect-nonce";
 import { OffsetCursor } from "@gadgets/gatekeeper-kit/cursors";
+import { describeSend, describeThreadChange, formatAddress, type MessageSummary } from "./approval";
 import {
   clearSimulatedKeywordsIfLatest,
   deletePendingAction,
@@ -756,12 +757,11 @@ async function stageSend(
   // considers pending and approvable — applyAction() would find nothing when it's later approved.
   // An orphaned record from a genuine pre-commit rejection is harmless (never referenced again).
   const { params } = pending;
-  const recipients = [...params.to, ...params.cc ?? [], ...params.bcc ?? []]
-    .map(address => address.email).join(", ");
   try {
     await approvalQueue.submitAction(actionId, {
       title,
-      description: `${title}: "${params.subject}" to ${recipients}.`,
+      ...describeSend(
+        `${title} from this Fastmail account. Sending can't be undone.`, params),
       // Sending is irreversible: EmailSubmission has no "unsend".
       implementsRevert: false,
     });
@@ -1035,22 +1035,69 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
     return result;
   }
 
-  async #submitPatch(title: string, description: string, patch: Record<string, unknown>): Promise<void> {
+  /**
+   * Who sent which of this thread's messages, so the approver can tell what a change touches.
+   * Best-effort: a failed lookup leaves the description with the message count only, rather than
+   * failing the action.
+   */
+  async #messageSummaries(): Promise<MessageSummary[] | undefined> {
+    try {
+      const grant = await this.#account.getGrant();
+      const emails = await getMessages(
+        grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, this.#messageIds);
+      return emails.map(email => ({
+        from: email.from?.map(formatAddress).join(", ") || "(no sender)",
+        subject: email.subject || "(no subject)",
+        receivedAt: email.receivedAt,
+      }));
+    } catch (error) {
+      logError("approval.summaryFailed", error);
+      return undefined;
+    }
+  }
+
+  /** A folder's name for the approver, or its id when it can't be looked up. */
+  async #folderName(folderId: string): Promise<string> {
+    try {
+      const now = Date.now();
+      let folders = getCachedFolders(this.#kv, now);
+      if (!folders) {
+        const grant = await this.#account.getGrant();
+        folders = await listMailboxes(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission);
+        putCachedFolders(this.#kv, folders, now);
+      }
+      return folders.find(folder => folder.id === folderId)?.name ?? folderId;
+    } catch (error) {
+      logError("approval.folderLookupFailed", error);
+      return folderId;
+    }
+  }
+
+  async #submitPatch(
+      title: string, intro: string, patch: Record<string, unknown>,
+      extra: { label: string; value: string }[] = []): Promise<void> {
+    const summaries = await this.#messageSummaries();
     const actionId = nextActionId(this.#kv);
     setPendingAction(this.#kv, actionId, { kind: "patch", emailIds: this.#messageIds, patch });
     // Not cleaned up on a thrown error — see the matching comment in FastmailSessionImpl.send():
     // the overseer commits the action record before submitAction() returns, so deleting the local
     // record on a failed await could orphan a genuinely-pending, still-approvable action.
-    await this.#approvalQueue.submitAction(actionId, { title, description, implementsRevert: false });
+    await this.#approvalQueue.submitAction(actionId, {
+      title,
+      ...describeThreadChange(intro, this.#messageIds.length, summaries, extra),
+      implementsRevert: false,
+    });
   }
 
   async moveToFolder(folderId: string): Promise<void> {
+    const folder = await this.#folderName(folderId);
     await this.#submitPatch(
-      "Move Fastmail thread", `Move this thread (${this.#messageIds.length} message(s)) to another folder.`,
-      { mailboxIds: { [folderId]: true } });
+      "Move Fastmail thread", "Move every message in this thread to another folder.",
+      { mailboxIds: { [folderId]: true } }, [{ label: "To folder", value: folder }]);
   }
 
   async #patchKeyword(keyword: string, present: boolean, title: string): Promise<void> {
+    const summaries = await this.#messageSummaries();
     const actionId = nextActionId(this.#kv);
     setPendingAction(this.#kv, actionId, {
       kind: "patch",
@@ -1067,8 +1114,12 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
     // orphan a still-approvable action) from what the overseer actually recorded.
     await this.#approvalQueue.submitAction(actionId, {
       title,
-      description: `${present ? "Add" : "Remove"} the "${keyword}" keyword on this thread's ` +
-        `${this.#messageIds.length} message(s).`,
+      ...describeThreadChange(
+        keyword === "$seen"
+          ? `Mark every message in this thread as ${present ? "read" : "unread"}.`
+          : `${present ? "Add a keyword to" : "Remove a keyword from"} every message in this thread.`,
+        this.#messageIds.length, summaries,
+        keyword === "$seen" ? [] : [{ label: "Keyword", value: keyword }]),
       implementsRevert: false,
     });
   }
