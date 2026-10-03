@@ -15,11 +15,12 @@ implementation constraints that are easy to miss.
 
 ## Related repositories and references
 
-- [Cloudflare OS starter](https://github.com/cloudflare/cloudflare-os-starter): the consuming
+- [Cloudflare OS starter](https://github.com/michielappelman/cloudflare-os-starter): the consuming
   workspace and deployment host. In this workspace it is normally available at
   `../cloudflare-os-starter/`.
-- [`@gadgets/gatekeeper-kit`](../cloudflare-os-starter/cloudflare-os/packages/gatekeeper-kit/): the
-  shared library used for connect pages, credential staging, nonces, cursors, and Worker plumbing.
+- [`@gadgets/gatekeeper-kit`](https://github.com/michielappelman/cloudflare-os/tree/main/packages/gatekeeper-kit):
+  the shared library used for connect pages, credential staging, nonces, cursors, and Worker
+  plumbing. Use the copy pinned by the starter (`../cloudflare-os-starter/cloudflare-os/packages/gatekeeper-kit/`).
   Read its `AGENTS.md`, `README.md`, and `USAGE.md` before changing those integrations.
 - [Fastmail JMAP developer documentation](https://www.fastmail.com/dev/): service discovery and
   Fastmail-specific behavior.
