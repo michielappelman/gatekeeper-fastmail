@@ -24,7 +24,8 @@ pnpm install
 The starter must include `packages/*` in `pnpm-workspace.yaml`, and its deploy wrapper must treat
 `packages/gatekeeper-fastmail` as the Fastmail Worker package. In practice that means:
 
-1. Read this package's `wrangler.jsonc` as the base Fastmail config.
+1. Read this package's `wrangler.jsonc` as the base Fastmail config. It is generated from
+   `cloudflare.config.ts`: edit that, then run `pnpm configs:generate` from the starter root.
 2. Generate the production config with the deployment's account, Worker name, service bindings,
    `BASE_URL`, and observability settings.
 3. Run `vp run -F gatekeeper-fastmail --no-cache build` before deploying the Worker.
