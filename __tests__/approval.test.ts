@@ -24,6 +24,11 @@ describe("describeSend", () => {
     expect(rendered.descriptionIsComplete).toBe(true);
   });
 
+  it("omits From for a draft without a known sender", () => {
+    const { from: _from, ...draft } = params;
+    expect(field(describeSend("Save draft.", draft), "From")).toBeUndefined();
+  });
+
   it("shows the derived HTML part exactly as it will be sent", () => {
     const rendered = describeSend("Send email.", params);
     expect(field(rendered, "HTML")).toMatchObject({ kind: "text", value: textToHtml(params.textBody) });

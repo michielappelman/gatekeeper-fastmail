@@ -4,7 +4,7 @@
 
 `gatekeeper-fastmail` is a Cloudflare Worker package for Cloudflare OS. It exposes one scoped
 resource: the whole mailbox of one connected Fastmail account. The agent can list/search threads,
-read messages and attachments, organize messages, and optionally send mail.
+read messages and attachments, organize messages, prepare drafts, and optionally send mail.
 
 This repository is normally a Git submodule under `cloudflare-os-starter/packages/`. It is not a
 standalone npm package: `@gadgets/*` dependencies resolve from the consuming Cloudflare OS
@@ -42,7 +42,8 @@ src/fastmail.ts       Worker entrypoint, UserAccount, gatekeeper DO, sessions, c
 src/fastmail-api.ts   Direct JMAP fetch client and Fastmail session discovery
 src/fastmail-types.ts JMAP wire types and capability constants
 src/resource.ts       Whole-mailbox resource URL and validation
-src/cache.ts          Folder cache, pending actions, and simulated keyword overlays
+src/cache.ts          Folder cache, pending actions, simulated keyword overlays, draft records
+src/drafts.ts         Draft revision ordering: what the agent sees, apply and reject
 src/errors.ts         Stable FastmailErrorCode mapping
 src/configurator/     Zero-field whole-mailbox configurator source/types
 __tests__/             JMAP, resource, cache, and configurator tests
@@ -62,9 +63,13 @@ __tests__/             JMAP, resource, cache, and configurator tests
 - Fastmail API tokens are bearer tokens, not OAuth grants. There is no refresh cycle. A 401 must
   become `AUTH_EXPIRED`, notify the Workshop once, and require reconnecting with a new token.
 - Connect validation must confirm Mail capability through `GET /jmap/session` before storing the
-  grant. `send()` also requires Email submission capability and a usable sender identity.
+  grant. Every send path (`send()`, `reply()`, a draft's `send()`) also requires Email submission
+  capability and a usable sender identity (`requireSender()`). A grant without them is advertised
+  as `FastmailDraftOnlySession`, which has no send methods.
 - Every read path authorizes observation through `ApprovalQueue`, including cached and simulated
-  results. Every mutation is queued for approval; `getAutoApprovableActions()` remains empty.
+  results. Every mutation is queued for approval. Draft changes, read state, keywords and moves
+  carry an `actionKind` and `autoApprovable: true`, so a user may opt in to applying them
+  automatically; anything that sends mail must never carry either, so it always waits for a person.
 - Mailbox bindings are private to the connecting account. Observer sharing is intentionally
   rejected.
 - `moveToFolder()` takes a Mailbox id. Use `listFolders()` and the stable `role` field to find
@@ -110,6 +115,13 @@ mocked `fetch`; no Fastmail credentials belong in the repository.
   latest overlay for that email.
 - Folder moves do not have a simulated folder-membership view.
 - Sends have no simulation and are irreversible; `send()` resolves when queued, not when delivered.
+- Drafts have a stable gatekeeper id (`draft:<id>` records) because every applied edit replaces the
+  JMAP Email. Each draft change is a revision keyed by action id; the agent sees the newest one,
+  applying a revision older than the applied one is a no-op, and rejecting one falls back to the
+  newest remaining revision. Every revision carries the full content, so never make one depend on
+  an earlier revision having been applied. Applies for one draft are serialized in memory
+  (`#withDraftLock`). A draft send submits the approved snapshot as a fresh Email, then discards
+  the stored copy.
 - `FastmailThread.reply()` queues the same `send` action with `inReplyTo`/`references` taken from
   the thread's latest message. Fastmail threads strictly on these Message-ID headers (unlike
   Gmail's subject heuristic), so a reply sent through plain `send()` lands outside the thread. The

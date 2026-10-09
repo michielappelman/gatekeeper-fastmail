@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   ATTACHMENT_MARKDOWN_MAX_CHARS,
   clearSimulatedKeywordsIfLatest,
+  currentDraftRevision,
+  deleteDraftRecord,
   deletePendingAction,
+  getDraftRecord,
+  listDraftRecords,
+  putDraftRecord,
   FOLDER_CACHE_TTL_MS,
   getCachedAttachmentMarkdown,
   getCachedFolders,
@@ -125,5 +130,38 @@ describe("simulated keywords", () => {
   it("passes real keywords through unchanged with no overlay", () => {
     const real = { "$seen": true };
     expect(mergeSimulatedKeywords(real, undefined)).toEqual(real);
+  });
+});
+
+const draftContent = (subject: string) => ({ to: [], subject });
+
+describe("draft records", () => {
+  it("keeps an index so drafts list oldest first", () => {
+    const kv = makeKv();
+    putDraftRecord(kv, { id: "a", pending: {} });
+    putDraftRecord(kv, { id: "b", pending: {} });
+    putDraftRecord(kv, { id: "a", from: "me@x", pending: {} });
+    expect(listDraftRecords(kv).map(record => record.id)).toEqual(["a", "b"]);
+    expect(getDraftRecord(kv, "a")?.from).toBe("me@x");
+
+    deleteDraftRecord(kv, "a");
+    expect(listDraftRecords(kv).map(record => record.id)).toEqual(["b"]);
+    expect(getDraftRecord(kv, "a")).toBeUndefined();
+  });
+
+  it("shows the newest revision by action id, pending or applied", () => {
+    const record = {
+      id: "d",
+      pending: {
+        3: { kind: "content" as const, content: draftContent("three"), at: 3 },
+        5: { kind: "deleted" as const, at: 5 },
+      },
+      applied: { actionId: 4, revision: { kind: "content" as const, content: draftContent("four"), at: 4 } },
+    };
+    expect(currentDraftRevision(record)).toEqual({ actionId: 5, revision: { kind: "deleted", at: 5 } });
+
+    delete (record.pending as Record<number, unknown>)[5];
+    expect(currentDraftRevision(record)?.actionId).toBe(4);
+    expect(currentDraftRevision({ id: "e", pending: {} })).toBeUndefined();
   });
 });

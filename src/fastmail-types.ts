@@ -13,6 +13,8 @@ export const JMAP_SUBMISSION_CAPABILITY = "urn:ietf:params:jmap:submission";
 
 /** The JMAP session resource, `GET <sessionUrl>` (Fastmail: `https://api.fastmail.com/jmap/session`). */
 export type JmapSessionResource = {
+  /** The login the token belongs to; Fastmail uses the account's primary address. */
+  username?: string;
   apiUrl: string;
   downloadUrl: string;
   uploadUrl: string;

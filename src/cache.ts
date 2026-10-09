@@ -15,6 +15,12 @@
  * that email, and resolving the first only clears it if it is still the latest one. Good enough for
  * one mailbox binding, where concurrent pending patches on the same message are rare; documented
  * here rather than hidden, per the skill's guidance on simulation gaps.
+ *
+ * Drafts are simulated differently: each draft created through this binding has a record holding
+ * every submitted-but-unresolved revision (content, deletion, or send) keyed by its action id, plus
+ * the newest revision already applied to Fastmail. The caller always sees the revision with the
+ * highest action id, and applying a revision older than the applied one is a no-op, so approvals
+ * arriving out of order can never overwrite newer content with older content.
  */
 
 import type { SendEmailParams } from "./fastmail-api";
@@ -78,6 +84,8 @@ export function putCachedAttachmentMarkdown(
  */
 export type PendingAction =
   | { kind: "patch"; emailIds: string[]; patch: Record<string, unknown> }
+  /** A revision of a draft; the revision itself is `DraftRecord.pending[actionId]`. */
+  | { kind: "draft"; draftId: string }
   | {
       kind: "send";
       params: SendEmailParams;
@@ -138,4 +146,72 @@ export function mergeSimulatedKeywords(
     else delete merged[keyword];
   }
   return merged;
+}
+
+/** A draft's addressees, subject, bodies, and (for a reply) threading headers. */
+export type DraftContent = Omit<SendEmailParams, "from">;
+
+/** One submitted change to a draft. `at` is when it was submitted, in epoch milliseconds. */
+export type DraftRevision =
+  | { kind: "content"; content: DraftContent; at: number }
+  | { kind: "deleted"; at: number }
+  /** Sending: `params` is the exact message the approver sees, and is dropped once applied. */
+  | { kind: "sent"; params?: SendEmailParams; at: number };
+
+/** A draft created through this binding. Its id is the gatekeeper's own, stable across edits, since
+ * every edit replaces the underlying JMAP Email (and so its id). */
+export type DraftRecord = {
+  id: string;
+  /** The `From` address, fixed when the draft is created; absent when none could be determined. */
+  from?: string;
+  /** For a reply draft: the email it answers, marked `$answered` once the draft is sent. */
+  answersEmailId?: string;
+  /** Submitted revisions not yet approved or rejected, keyed by action id. */
+  pending: Record<string, DraftRevision>;
+  /** The newest revision applied to Fastmail, and the Email holding it while it is content. */
+  applied?: { actionId: number; revision: DraftRevision; emailId?: string };
+};
+
+const DRAFT_INDEX_KEY = "drafts:index";
+
+function draftKey(draftId: string): string {
+  return `draft:${draftId}`;
+}
+
+export function getDraftRecord(kv: CacheKv, draftId: string): DraftRecord | undefined {
+  return kv.get<DraftRecord>(draftKey(draftId));
+}
+
+export function putDraftRecord(kv: CacheKv, record: DraftRecord): void {
+  const index = kv.get<string[]>(DRAFT_INDEX_KEY) ?? [];
+  if (!index.includes(record.id)) kv.put<string[]>(DRAFT_INDEX_KEY, [...index, record.id]);
+  kv.put<DraftRecord>(draftKey(record.id), record);
+}
+
+export function deleteDraftRecord(kv: CacheKv, draftId: string): void {
+  const index = kv.get<string[]>(DRAFT_INDEX_KEY) ?? [];
+  kv.put<string[]>(DRAFT_INDEX_KEY, index.filter(id => id !== draftId));
+  kv.delete(draftKey(draftId));
+}
+
+/** Every draft record, oldest first, including drafts since deleted or sent. */
+export function listDraftRecords(kv: CacheKv): DraftRecord[] {
+  return (kv.get<string[]>(DRAFT_INDEX_KEY) ?? [])
+    .map(id => getDraftRecord(kv, id))
+    .filter((record): record is DraftRecord => record !== undefined);
+}
+
+/** The revision the caller sees: the newest by action id, pending or applied. Undefined only for a
+ * draft whose every revision was rejected before any was applied. */
+export function currentDraftRevision(
+  record: DraftRecord,
+): { actionId: number; revision: DraftRevision } | undefined {
+  let current = record.applied
+    ? { actionId: record.applied.actionId, revision: record.applied.revision }
+    : undefined;
+  for (const [id, revision] of Object.entries(record.pending)) {
+    const actionId = Number(id);
+    if (!current || actionId > current.actionId) current = { actionId, revision };
+  }
+  return current;
 }

@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { FastmailError } from "../src/errors";
 import {
+  destroyEmails,
   fetchAccountInfo,
   fetchIdentityEmail,
+  findDraftsMailboxId,
   getReplySource,
   listMailboxes,
   queryThreadPage,
@@ -11,6 +13,7 @@ import {
   sendEmail,
   textToHtml,
   updateEmails,
+  writeDraft,
 } from "../src/fastmail-api";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -32,6 +35,7 @@ describe("fetchAccountInfo", () => {
     }));
     const info = await fetchAccountInfo("token123", fetchImpl);
     expect(info.accountId).toBe("u1");
+    expect(info.username).toBeUndefined();
     expect(info.hasSubmission).toBe(true);
     expect(fetchImpl).toHaveBeenCalledWith(
       "https://api.fastmail.com/jmap/session",
@@ -48,6 +52,19 @@ describe("fetchAccountInfo", () => {
     }));
     const info = await fetchAccountInfo("token", fetchImpl);
     expect(info.hasSubmission).toBe(false);
+  });
+
+  it("records the session's login address", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      username: "me@fastmail.com",
+      apiUrl: "https://api.fastmail.com/jmap/api/",
+      downloadUrl: "https://api.fastmail.com/jmap/download/",
+      uploadUrl: "https://api.fastmail.com/jmap/upload/",
+      accounts: { u1: { accountCapabilities: { "urn:ietf:params:jmap:mail": {} } } },
+      primaryAccounts: { "urn:ietf:params:jmap:mail": "u1" },
+    }));
+    const info = await fetchAccountInfo("token", fetchImpl);
+    expect(info.username).toBe("me@fastmail.com");
   });
 
   it("throws AUTH_EXPIRED on a 401", async () => {
@@ -391,6 +408,110 @@ describe("resolveSendContext", () => {
     const fetchImpl = contextResponse([]);
     await expect(resolveSendContext("https://api/", "token", "u1", "me@fastmail.com", fetchImpl))
       .rejects.toMatchObject({ code: "SUBMISSION_NOT_AUTHORIZED" });
+  });
+});
+
+describe("findDraftsMailboxId", () => {
+  it("returns the mailbox with the drafts role", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [["Mailbox/get", { list: [
+        { id: "mb-inbox", role: "inbox" }, { id: "mb-drafts", role: "drafts" },
+      ] }, "c1"]],
+    }));
+    await expect(findDraftsMailboxId("https://api/", "token", "u1", false, fetchImpl))
+      .resolves.toBe("mb-drafts");
+    expect(requestBody(fetchImpl).using).toEqual(["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"]);
+  });
+
+  it("throws RESOURCE_NOT_FOUND without a Drafts mailbox", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [["Mailbox/get", { list: [{ id: "mb-inbox", role: "inbox" }] }, "c1"]],
+    }));
+    await expect(findDraftsMailboxId("https://api/", "token", "u1", false, fetchImpl))
+      .rejects.toMatchObject({ code: "RESOURCE_NOT_FOUND" });
+  });
+});
+
+const draftCreated = () => vi.fn(async () => jsonResponse({
+  methodResponses: [["Email/set", { created: { draft: { id: "e-new" } } }, "c1"]],
+}));
+
+describe("writeDraft", () => {
+  it("creates a $draft Email in Drafts without submitting it", async () => {
+    const fetchImpl = draftCreated();
+    const result = await writeDraft("https://api/", "token", "u1", false, {
+      from: "me@fastmail.com", to: [{ email: "you@example.com" }], subject: "Hi", textBody: "Hello",
+    }, "mb-drafts", undefined, fetchImpl);
+    expect(result).toEqual({ emailId: "e-new" });
+
+    const body = requestBody(fetchImpl);
+    expect(body.using).not.toContain("urn:ietf:params:jmap:submission");
+    expect(body.methodCalls).toHaveLength(1);
+    const [[name, emailSet]] = body.methodCalls;
+    expect(name).toBe("Email/set");
+    expect(emailSet.destroy).toBeUndefined();
+    expect(emailSet.create.draft).toMatchObject({
+      mailboxIds: { "mb-drafts": true },
+      keywords: { "$draft": true, "$seen": true },
+      from: [{ email: "me@fastmail.com" }],
+      to: [{ email: "you@example.com" }],
+      subject: "Hi",
+      bodyValues: { text: { value: "Hello" }, html: { value: textToHtml("Hello") } },
+    });
+  });
+
+  it("replaces the previous copy in the same request", async () => {
+    const fetchImpl = draftCreated();
+    await writeDraft("https://api/", "token", "u1", true, {
+      to: [], subject: "", textBody: "draft",
+    }, "mb-drafts", "e-old", fetchImpl);
+    const [[, emailSet]] = requestBody(fetchImpl).methodCalls;
+    expect(emailSet.destroy).toEqual(["e-old"]);
+    expect(emailSet.create.draft.from).toBeUndefined();
+  });
+
+  it("still saves when the replaced copy is already gone", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [["Email/set", {
+        created: { draft: { id: "e-new" } }, notDestroyed: { "e-old": { type: "notFound" } },
+      }, "c1"]],
+    }));
+    await expect(writeDraft("https://api/", "token", "u1", false, {
+      to: [], subject: "",
+    }, "mb-drafts", "e-old", fetchImpl)).resolves.toEqual({ emailId: "e-new" });
+  });
+
+  it("maps a rejected create to a FastmailError", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [["Email/set", { notCreated: { draft: { type: "forbidden" } } }, "c1"]],
+    }));
+    await expect(writeDraft("https://api/", "token", "u1", false, {
+      to: [], subject: "",
+    }, "mb-drafts", undefined, fetchImpl)).rejects.toMatchObject({ code: "SUBMISSION_NOT_AUTHORIZED" });
+  });
+});
+
+describe("destroyEmails", () => {
+  it("ignores emails that are already gone", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [["Email/set", { notDestroyed: { e1: { type: "notFound" } } }, "c1"]],
+    }));
+    await destroyEmails("https://api/", "token", "u1", false, ["e1"], fetchImpl);
+    expect(requestBody(fetchImpl).methodCalls[0][1].destroy).toEqual(["e1"]);
+  });
+
+  it("throws when Fastmail refuses to destroy one", async () => {
+    const fetchImpl = vi.fn(async () => jsonResponse({
+      methodResponses: [["Email/set", { notDestroyed: { e1: { type: "forbidden" } } }, "c1"]],
+    }));
+    await expect(destroyEmails("https://api/", "token", "u1", false, ["e1"], fetchImpl))
+      .rejects.toMatchObject({ code: "SUBMISSION_NOT_AUTHORIZED" });
+  });
+
+  it("makes no request for an empty list", async () => {
+    const fetchImpl = vi.fn();
+    await destroyEmails("https://api/", "token", "u1", false, [], fetchImpl);
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
 

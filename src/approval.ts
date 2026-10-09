@@ -5,7 +5,7 @@
 import {
   buildDescription, type RenderedDescription,
 } from "@gadgets/gatekeeper-kit/action-description";
-import type { SendEmailParams } from "./fastmail-api";
+import type { DraftEmailParams } from "./fastmail-api";
 import { textToHtml } from "./fastmail-api";
 import type { JmapEmailAddress } from "./fastmail-types";
 
@@ -18,12 +18,13 @@ export function formatAddress(address: JmapEmailAddress): string {
 }
 
 /**
- * The description of a send or reply: the headers and both bodies exactly as `sendEmail()` will
- * write them. Without an explicit HTML body, the HTML part is the one `sendEmail()` derives from the
- * plain text, shown as it will be sent.
+ * The description of a send, reply, or saved draft: the headers and both bodies exactly as
+ * `sendEmail()` or `writeDraft()` will write them. Without an explicit HTML body, the HTML part is
+ * the one derived from the plain text, shown as it will be written.
  */
-export function describeSend(intro: string, params: SendEmailParams): RenderedDescription {
-  const builder = buildDescription(intro).inline("From", params.from);
+export function describeSend(intro: string, params: DraftEmailParams): RenderedDescription {
+  const builder = buildDescription(intro);
+  if (params.from !== undefined) builder.inline("From", params.from);
   if (params.to.length) builder.list("To", params.to.map(formatAddress));
   if (params.cc?.length) builder.list("Cc", params.cc.map(formatAddress));
   if (params.bcc?.length) builder.list("Bcc", params.bcc.map(formatAddress));

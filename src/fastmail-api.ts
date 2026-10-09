@@ -32,6 +32,9 @@ export type FastmailAccountInfo = {
   accountId: string;
   hasSubmission: boolean;
   identityEmail?: string;
+  /** The session's login address: the fallback `From` on drafts when `Identity/get` is unavailable,
+   * as it is for a token without Email submission. Absent on grants stored before it was recorded. */
+  username?: string;
 };
 
 /**
@@ -66,6 +69,7 @@ export async function fetchAccountInfo(
     uploadUrlTemplate: session.uploadUrl,
     accountId,
     hasSubmission,
+    username: session.username || undefined,
   };
 }
 
@@ -410,6 +414,46 @@ export function textToHtml(text: string): string {
     `Arial, sans-serif; font-size: 14px; line-height: 1.5;">\n${body}\n</div>`;
 }
 
+/** The content of an Email to create in Drafts: the fields `sendEmail()` and `writeDraft()` share.
+ * `from` is optional only for a draft, whose sender Fastmail fills in when it is opened. */
+export type DraftEmailParams = Omit<SendEmailParams, "from"> & { from?: string };
+
+/**
+ * The `Email/set create` object for a message in Drafts. Falls back to a derived HTML alternative
+ * when only `textBody` was given, so a plain `{ text: "..." }` message (the common case) doesn't ship
+ * without any text/html part at all.
+ */
+function draftEmailCreate(
+  params: DraftEmailParams, draftsMailboxId: string,
+): Record<string, unknown> {
+  const bodyValues: Record<string, { value: string }> = {};
+  const textBody: { partId: string; type: string }[] = [];
+  const htmlBody: { partId: string; type: string }[] = [];
+  if (params.textBody !== undefined) {
+    bodyValues.text = { value: params.textBody };
+    textBody.push({ partId: "text", type: "text/plain" });
+  }
+  const html = params.htmlBody ?? (params.textBody !== undefined ? textToHtml(params.textBody) : undefined);
+  if (html !== undefined) {
+    bodyValues.html = { value: html };
+    htmlBody.push({ partId: "html", type: "text/html" });
+  }
+  return {
+    mailboxIds: { [draftsMailboxId]: true },
+    keywords: { "$draft": true, "$seen": true },
+    from: params.from !== undefined ? [{ email: params.from }] : undefined,
+    to: params.to,
+    cc: params.cc,
+    bcc: params.bcc,
+    subject: params.subject,
+    inReplyTo: params.inReplyTo,
+    references: params.references,
+    bodyValues,
+    textBody: textBody.length > 0 ? textBody : undefined,
+    htmlBody: htmlBody.length > 0 ? htmlBody : undefined,
+  };
+}
+
 /**
  * Sends a message: creates a draft `Email` in Drafts and an `EmailSubmission` referencing it in one
  * JMAP request, with `onSuccessUpdateEmail` moving the message from Drafts to Sent and clearing
@@ -419,21 +463,6 @@ export async function sendEmail(
   apiUrl: string, apiToken: string, accountId: string, params: SendEmailParams, context: SendContext,
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ emailId: string }> {
-  const bodyValues: Record<string, { value: string }> = {};
-  const textBody: { partId: string; type: string }[] = [];
-  const htmlBody: { partId: string; type: string }[] = [];
-  if (params.textBody !== undefined) {
-    bodyValues.text = { value: params.textBody };
-    textBody.push({ partId: "text", type: "text/plain" });
-  }
-  // Falls back to a derived HTML alternative when only textBody was given, so a plain
-  // `{ text: "..." }` send (the common case) doesn't ship without any text/html part at all.
-  const html = params.htmlBody ?? (params.textBody !== undefined ? textToHtml(params.textBody) : undefined);
-  if (html !== undefined) {
-    bodyValues.html = { value: html };
-    htmlBody.push({ partId: "html", type: "text/html" });
-  }
-
   const draftId = "draft1";
   const submissionId = "submission1";
   const onSuccessPatch: Record<string, unknown> = { "keywords/$draft": null };
@@ -446,22 +475,7 @@ export async function sendEmail(
     methodCalls: [
       ["Email/set", {
         accountId,
-        create: {
-          [draftId]: {
-            mailboxIds: { [context.draftsMailboxId]: true },
-            keywords: { "$draft": true, "$seen": true },
-            from: [{ email: params.from }],
-            to: params.to,
-            cc: params.cc,
-            bcc: params.bcc,
-            subject: params.subject,
-            inReplyTo: params.inReplyTo,
-            references: params.references,
-            bodyValues,
-            textBody: textBody.length > 0 ? textBody : undefined,
-            htmlBody: htmlBody.length > 0 ? htmlBody : undefined,
-          },
-        },
+        create: { [draftId]: draftEmailCreate(params, context.draftsMailboxId) },
       }, "c1"],
       ["EmailSubmission/set", {
         accountId,
@@ -500,4 +514,70 @@ export async function sendEmail(
     throw new FastmailError("UPSTREAM_UNAVAILABLE", "Fastmail did not report a created draft to send.");
   }
   return { emailId: created.id };
+}
+
+// ---------------------------------------------------------------------------
+// Drafts
+
+/** The id of the account's Drafts mailbox (`role: "drafts"`). */
+export async function findDraftsMailboxId(
+  apiUrl: string, apiToken: string, accountId: string, hasSubmission: boolean,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string> {
+  const result = await call(apiUrl, apiToken, usingFor(hasSubmission), "Mailbox/get", {
+    accountId, properties: ["id", "role"],
+  }, fetchImpl);
+  const mailboxes = (result.list as { id: string; role: string | null }[] | undefined) ?? [];
+  const draftsMailboxId = mailboxes.find(mailbox => mailbox.role === "drafts")?.id;
+  if (!draftsMailboxId) {
+    throw new FastmailError(
+      "RESOURCE_NOT_FOUND", "This Fastmail account has no Drafts mailbox to save the draft in.");
+  }
+  return draftsMailboxId;
+}
+
+/**
+ * Saves a draft in Drafts, replacing `replacesEmailId` in the same `Email/set` when given. JMAP
+ * Emails are immutable apart from keywords and mailboxes (RFC 8621 §4.6), so an edited draft is a
+ * new Email with a new id; this returns it. A replaced Email that is already gone (discarded or
+ * sent from Fastmail itself) is not an error: the new copy is still saved.
+ */
+export async function writeDraft(
+  apiUrl: string, apiToken: string, accountId: string, hasSubmission: boolean,
+  params: DraftEmailParams, draftsMailboxId: string, replacesEmailId: string | undefined,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ emailId: string }> {
+  const result = await call(apiUrl, apiToken, usingFor(hasSubmission), "Email/set", {
+    accountId,
+    create: { draft: draftEmailCreate(params, draftsMailboxId) },
+    destroy: replacesEmailId !== undefined ? [replacesEmailId] : undefined,
+  }, fetchImpl);
+  const notCreated = (result.notCreated as Record<string, JmapMethodError> | undefined)?.draft;
+  if (notCreated) {
+    throw new FastmailError(
+      methodErrorCode(notCreated), `Fastmail rejected the draft: ${describeMethodError(notCreated)}.`);
+  }
+  const created = (result.created as Record<string, { id: string }> | undefined)?.draft;
+  if (!created) {
+    throw new FastmailError("UPSTREAM_UNAVAILABLE", "Fastmail did not report the saved draft.");
+  }
+  return { emailId: created.id };
+}
+
+/** Permanently destroys emails. Ids that are already gone are ignored. */
+export async function destroyEmails(
+  apiUrl: string, apiToken: string, accountId: string, hasSubmission: boolean, emailIds: string[],
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  if (emailIds.length === 0) return;
+  const result = await call(apiUrl, apiToken, usingFor(hasSubmission), "Email/set", {
+    accountId, destroy: emailIds,
+  }, fetchImpl);
+  const notDestroyed = result.notDestroyed as Record<string, JmapMethodError> | undefined;
+  const failedId = emailIds.find(id => notDestroyed?.[id] && notDestroyed[id].type !== "notFound");
+  if (failedId) {
+    const failure = notDestroyed![failedId];
+    throw new FastmailError(
+      methodErrorCode(failure), `Fastmail rejected deleting ${failedId}: ${failure.type}.`);
+  }
 }

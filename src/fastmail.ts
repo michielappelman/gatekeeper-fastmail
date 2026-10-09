@@ -3,6 +3,7 @@ import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   stripTrailingSlashes,
   type AccountDescription,
+  type ActionKind,
   type ApprovalQueue,
   type ConnectHandoff,
   type Cursor,
@@ -34,9 +35,16 @@ import {
 } from "@gadgets/gatekeeper-kit/connect-nonce";
 import { OffsetCursor } from "@gadgets/gatekeeper-kit/cursors";
 import { describeSend, describeThreadChange, formatAddress, type MessageSummary } from "./approval";
+import type { RenderedDescription } from "@gadgets/gatekeeper-kit/action-description";
 import {
   clearSimulatedKeywordsIfLatest,
+  currentDraftRevision,
   deletePendingAction,
+  listDraftRecords,
+  putDraftRecord,
+  type DraftContent,
+  type DraftRecord,
+  type DraftRevision,
   getCachedAttachmentMarkdown,
   getCachedFolders,
   getPendingAction,
@@ -47,6 +55,7 @@ import {
   setPendingAction,
   setSimulatedKeywords,
 } from "./cache";
+import { applyDraftRevision, currentDraft, rejectDraftRevision, toDraftInfo } from "./drafts";
 import { FastmailError } from "./errors";
 import { assertMarkdownConvertible, convertToMarkdown } from "./markdown";
 import {
@@ -63,6 +72,7 @@ import {
   sendEmail,
   updateEmails,
   type FastmailAccountInfo,
+  type JmapReplySource,
   type RawThreadEntry,
   type SendEmailParams,
 } from "./fastmail-api";
@@ -71,9 +81,13 @@ import { FASTMAIL_RESOURCE, parseResourceUrl, SUPPORTED_RESOURCES, toResourceUrl
 import type {
   FastmailAddress,
   FastmailAttachment,
+  FastmailDraftInfo,
+  FastmailDraftInput,
+  FastmailDraftPatch,
   FastmailFolder,
   FastmailMarkdownContent,
   FastmailMessage,
+  FastmailSendableDraft,
   FastmailSession,
   FastmailThread,
   FastmailThreadEntry,
@@ -372,9 +386,12 @@ export class UserAccount extends DurableObject<Env> {
     this.ctx.storage.kv.put("expiredNotified", false);
   }
 
-  async getIdentity(): Promise<{ email?: string } | undefined> {
+  /** The connected address, and whether the token can send mail (see `requireSender()`). */
+  async getIdentity(): Promise<{ email?: string; canSend: boolean } | undefined> {
     const grant = this.ctx.storage.kv.get<StoredGrant>("grant");
-    return grant ? { email: grant.identityEmail } : undefined;
+    return grant
+      ? { email: grant.identityEmail ?? grant.username, canSend: canSend(grant) }
+      : undefined;
   }
 
   async getGrant(): Promise<StoredGrant> {
@@ -583,14 +600,19 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
 
   async describe(): Promise<ResourceDescription> {
     const identity = await this.#userAccount().getIdentity();
+    // A token without Email submission gets the session type with no way to send, so the agent is
+    // never offered a method that can only fail. The runtime still refuses (`requireSender()`), and
+    // Fastmail itself refuses EmailSubmission for such a token.
+    const draftOnly = identity?.canSend === false;
+    const verbs = draftOnly ? "Read, organize, and draft" : "Read, organize, and send";
     return {
       url: toResourceUrl(),
       title: identity?.email ?? "Fastmail Mailbox",
       snippet: identity?.email
-        ? `Read, organize, and send email through ${identity.email} on Fastmail.`
-        : "Read, organize, and send email through this Fastmail account.",
+        ? `${verbs} email through ${identity.email} on Fastmail.`
+        : `${verbs} email through this Fastmail account.`,
       suggestedBindingName: "FASTMAIL",
-      tsType: "FastmailSession",
+      tsType: draftOnly ? "FastmailDraftOnlySession" : "FastmailSession",
     };
   }
 
@@ -598,8 +620,8 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
     return TYPES_CODE;
   }
 
-  async getAutoApprovableActions() {
-    return [];
+  async getAutoApprovableActions(): Promise<ActionKind[]> {
+    return Object.values(AUTO_APPROVABLE_KINDS);
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<FastmailSession> {
@@ -637,6 +659,9 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
           const context = await resolveSendContext(
             grant.apiUrl, grant.apiToken, grant.accountId, pending.params.from);
           await sendEmail(grant.apiUrl, grant.apiToken, grant.accountId, pending.params, context);
+        } else if (pending.kind === "draft") {
+          await this.#withDraftLock(
+            pending.draftId, () => applyDraftRevision(this.ctx.storage.kv, actionId, pending.draftId, grant));
         } else {
           await updateEmails(
             grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, pending.emailIds,
@@ -655,7 +680,7 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
       for (const emailId of pending.emailIds) {
         clearSimulatedKeywordsIfLatest(this.ctx.storage.kv, emailId, actionId);
       }
-    } else if (pending.answersEmailId) {
+    } else if (pending.kind === "send" && pending.answersEmailId) {
       // Best-effort, after the record is gone: the reply has already been sent, so failing (or
       // retrying) the approval over a missing "$answered" flag would be worse than the flag.
       const grant = await this.#userAccount().getGrant();
@@ -663,6 +688,22 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
         grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, [pending.answersEmailId],
         { "keywords/$answered": true },
       ).catch(error => logError("apply.markAnsweredFailed", error, { actionId }));
+    }
+  }
+
+  /** Tail of the apply chain per draft id. Applying a draft revision awaits Fastmail with the input
+   * gate open, so two approvals for one draft would otherwise both see the same "previous" Email and
+   * each write a copy. */
+  #draftLocks = new Map<string, Promise<void>>();
+
+  async #withDraftLock(draftId: string, fn: () => Promise<void>): Promise<void> {
+    const run = (this.#draftLocks.get(draftId) ?? Promise.resolve()).then(fn);
+    const tail = run.catch(() => {});
+    this.#draftLocks.set(draftId, tail);
+    try {
+      await run;
+    } finally {
+      if (this.#draftLocks.get(draftId) === tail) this.#draftLocks.delete(draftId);
     }
   }
 
@@ -686,6 +727,10 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
   async rejectAction(actionId: number): Promise<void> {
     const pending = getPendingAction(this.ctx.storage.kv, actionId);
     deletePendingAction(this.ctx.storage.kv, actionId);
+    if (pending?.kind === "draft") {
+      rejectDraftRevision(this.ctx.storage.kv, actionId, pending.draftId);
+      return;
+    }
     if (pending?.kind !== "patch") return;
     for (const emailId of pending.emailIds) {
       clearSimulatedKeywordsIfLatest(this.ctx.storage.kv, emailId, actionId);
@@ -695,8 +740,8 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
   async revertAction(_actionId: number): Promise<{ message: string; canRetry: boolean }> {
     return {
       message:
-          "This change can't be reverted automatically. Move the message back or re-apply the " +
-          "keyword yourself in Fastmail.",
+          "This change can't be reverted automatically. Move the message back, re-apply the " +
+          "keyword, or edit the draft yourself in Fastmail.",
       canRetry: false,
     };
   }
@@ -725,6 +770,29 @@ function nextActionId(kv: DurableObjectStorage["kv"]): number {
   return actionId;
 }
 
+/**
+ * Action kinds a user may opt in to auto-approving. Every one only prepares or organizes mail inside
+ * the account; sending (`send`, `reply`, a draft's `send`) carries no kind, so it always waits for
+ * a person.
+ */
+const AUTO_APPROVABLE_KINDS = {
+  draftCreate: { tag: "draftCreate", label: "Create an email draft" },
+  draftUpdate: { tag: "draftUpdate", label: "Edit an email draft" },
+  draftDelete: { tag: "draftDelete", label: "Discard an email draft" },
+  readState: { tag: "readState", label: "Mark email read or unread" },
+  keyword: { tag: "keyword", label: "Add or remove an email keyword" },
+  move: { tag: "move", label: "Move email to another folder" },
+} satisfies Record<string, ActionKind>;
+
+function autoApprovable(kind: ActionKind): { actionKind: ActionKind; autoApprovable: true } {
+  return { actionKind: kind, autoApprovable: true };
+}
+
+/** Whether `requireSender()` would succeed for this grant. */
+function canSend(grant: StoredGrant): boolean {
+  return grant.hasSubmission && grant.identityEmail !== undefined;
+}
+
 /** The address to send from, or a `SUBMISSION_NOT_AUTHORIZED` error if this grant cannot send. */
 function requireSender(grant: StoredGrant): string {
   if (!grant.hasSubmission) {
@@ -740,8 +808,84 @@ function requireSender(grant: StoredGrant): string {
   return grant.identityEmail;
 }
 
+/** The `From` for a draft: the sending identity when known, else the session's login address. */
+function draftSender(grant: StoredGrant): string | undefined {
+  return grant.identityEmail ?? grant.username;
+}
+
 function toJmapAddresses(addresses: FastmailAddress[] | undefined): SendEmailParams["to"] | undefined {
   return addresses?.map(address => ({ email: address.email, name: address.name }));
+}
+
+/** The params of a reply to `source`, as `reply()` sends it and `createReplyDraft()` saves it. */
+function replyContent(
+  source: JmapReplySource, from: string | undefined, body: { text?: string; html?: string },
+  options: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] } | undefined,
+): DraftContent {
+  const recipients = replyRecipients(source, from ?? "", options?.replyAll ?? false);
+  const cc = [...recipients.cc, ...toJmapAddresses(options?.cc) ?? []];
+  if (recipients.to.length === 0 && cc.length === 0) {
+    throw new FastmailError("RESOURCE_NOT_FOUND", "Could not determine who to reply to.");
+  }
+  const subject = source.subject ?? "";
+  const messageIds = source.messageId ?? [];
+  return {
+    to: recipients.to,
+    cc: cc.length > 0 ? cc : undefined,
+    bcc: toJmapAddresses(options?.bcc),
+    subject: /^re:/i.test(subject.trim()) ? subject : `Re: ${subject}`,
+    textBody: body.text,
+    htmlBody: body.html,
+    inReplyTo: messageIds.length > 0 ? messageIds : undefined,
+    references: messageIds.length > 0 ? [...source.references ?? [], ...messageIds] : undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Drafts, shared by FastmailSessionImpl, FastmailThreadImpl, and FastmailDraftImpl
+
+type DraftContext = {
+  approvalQueue: RpcStub<ApprovalQueue>;
+  account: DurableObjectStub<UserAccount>;
+  kv: DurableObjectStorage["kv"];
+};
+
+/**
+ * Records `revision` as pending on `record` and queues it for approval. The record is written
+ * before the only await, so a concurrent call on the same draft (which re-reads the record) sees it.
+ * Like `stageSend()`, nothing is cleaned up if `submitAction()` throws: the overseer may already have
+ * committed the action.
+ */
+async function stageDraftRevision(
+  ctx: DraftContext, record: DraftRecord, revision: DraftRevision, title: string,
+  description: RenderedDescription, kind: ActionKind | undefined,
+): Promise<void> {
+  const actionId = nextActionId(ctx.kv);
+  record.pending[actionId] = revision;
+  putDraftRecord(ctx.kv, record);
+  setPendingAction(ctx.kv, actionId, { kind: "draft", draftId: record.id });
+  await ctx.approvalQueue.submitAction(actionId, {
+    title,
+    ...description,
+    implementsRevert: false,
+    ...kind ? autoApprovable(kind) : {},
+  });
+}
+
+/** Creates a draft record for `content` and queues saving it to Drafts. */
+async function createDraftRecord(
+  ctx: DraftContext, from: string | undefined, content: DraftContent, answersEmailId?: string,
+): Promise<FastmailDraftImpl> {
+  const record: DraftRecord = { id: crypto.randomUUID(), from, answersEmailId, pending: {} };
+  await stageDraftRevision(
+    ctx, record, { kind: "content", content, at: Date.now() },
+    answersEmailId ? "Save reply draft" : "Create email draft",
+    describeSend(
+      `Save a new ${answersEmailId ? "reply " : ""}draft in this Fastmail account's Drafts folder. ` +
+      "Nothing is sent.",
+      { from, ...content }),
+    AUTO_APPROVABLE_KINDS.draftCreate);
+  return new FastmailDraftImpl(ctx.approvalQueue.dup(), ctx.account, ctx.kv, record.id);
 }
 
 async function stageSend(
@@ -889,6 +1033,39 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
     }, "Send email");
   }
 
+  async createDraft(draft: FastmailDraftInput): Promise<FastmailSendableDraft> {
+    const grant = await this.#account.getGrant();
+    return createDraftRecord(
+      { approvalQueue: this.#approvalQueue, account: this.#account, kv: this.#kv },
+      draftSender(grant), {
+        to: toJmapAddresses(draft.to) ?? [],
+        cc: toJmapAddresses(draft.cc),
+        bcc: toJmapAddresses(draft.bcc),
+        subject: draft.subject ?? "",
+        textBody: draft.text,
+        htmlBody: draft.html,
+      });
+  }
+
+  async listDrafts(): Promise<FastmailDraftInfo[]> {
+    const drafts: FastmailDraftInfo[] = [];
+    for (const record of listDraftRecords(this.#kv)) {
+      const current = currentDraftRevision(record);
+      if (current?.revision.kind === "content") {
+        drafts.push(toDraftInfo(record, current.revision.content, current.revision.at));
+      }
+    }
+    await this.#approvalQueue.authorizeObservation({
+      title: "List Fastmail drafts",
+      description: `Listed ${drafts.length} draft(s) created through this connection.`,
+    });
+    return drafts;
+  }
+
+  async getDraft(id: string): Promise<FastmailSendableDraft> {
+    currentDraft(this.#kv, id);
+    return new FastmailDraftImpl(this.#approvalQueue.dup(), this.#account, this.#kv, id);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -950,31 +1127,30 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
   ): Promise<void> {
     const grant = await this.#account.getGrant();
     const from = requireSender(grant);
+    const source = await this.#replySource(grant);
+    await stageSend(this.#approvalQueue, this.#kv, {
+      params: { from, ...replyContent(source, from, body, options) },
+      answersEmailId: source.id,
+    }, "Reply to email");
+  }
+
+  async createReplyDraft(
+    body: { text?: string; html?: string },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+  ): Promise<FastmailSendableDraft> {
+    const grant = await this.#account.getGrant();
+    const from = draftSender(grant);
+    const source = await this.#replySource(grant);
+    return createDraftRecord(
+      { approvalQueue: this.#approvalQueue, account: this.#account, kv: this.#kv },
+      from, replyContent(source, from, body, options), source.id);
+  }
+
+  async #replySource(grant: StoredGrant): Promise<JmapReplySource> {
     const source = await this.#call(() => getReplySource(
       grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, this.#messageIds));
     if (!source) throw new FastmailError("RESOURCE_NOT_FOUND", "This thread has no message to reply to.");
-
-    const recipients = replyRecipients(source, from, options?.replyAll ?? false);
-    const cc = [...recipients.cc, ...toJmapAddresses(options?.cc) ?? []];
-    if (recipients.to.length === 0 && cc.length === 0) {
-      throw new FastmailError("RESOURCE_NOT_FOUND", "Could not determine who to reply to.");
-    }
-    const subject = source.subject ?? "";
-    const messageIds = source.messageId ?? [];
-    await stageSend(this.#approvalQueue, this.#kv, {
-      params: {
-        from,
-        to: recipients.to,
-        cc: cc.length > 0 ? cc : undefined,
-        bcc: toJmapAddresses(options?.bcc),
-        subject: /^re:/i.test(subject.trim()) ? subject : `Re: ${subject}`,
-        textBody: body.text,
-        htmlBody: body.html,
-        inReplyTo: messageIds.length > 0 ? messageIds : undefined,
-        references: messageIds.length > 0 ? [...source.references ?? [], ...messageIds] : undefined,
-      },
-      answersEmailId: source.id,
-    }, "Reply to email");
+    return source;
   }
 
   async readAttachment(blobId: string): Promise<ArrayBuffer> {
@@ -1086,6 +1262,7 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
       title,
       ...describeThreadChange(intro, this.#messageIds.length, summaries, extra),
       implementsRevert: false,
+      ...autoApprovable(AUTO_APPROVABLE_KINDS.move),
     });
   }
 
@@ -1121,6 +1298,7 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
         this.#messageIds.length, summaries,
         keyword === "$seen" ? [] : [{ label: "Keyword", value: keyword }]),
       implementsRevert: false,
+      ...autoApprovable(keyword === "$seen" ? AUTO_APPROVABLE_KINDS.readState : AUTO_APPROVABLE_KINDS.keyword),
     });
   }
 
@@ -1138,5 +1316,98 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
 
   async markUnread(): Promise<void> {
     await this.#patchKeyword("$seen", false, "Mark Fastmail thread unread");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DraftImpl — the RPC interface exposed to the Gadget for one draft
+
+@validateRpc()
+export class FastmailDraftImpl extends RpcTarget implements FastmailSendableDraft {
+  #approvalQueue: RpcStub<ApprovalQueue>;
+  #account: DurableObjectStub<UserAccount>;
+  #kv: DurableObjectStorage["kv"];
+  #draftId: string;
+
+  constructor(
+      approvalQueue: RpcStub<ApprovalQueue>, account: DurableObjectStub<UserAccount>,
+      kv: DurableObjectStorage["kv"], draftId: string) {
+    super();
+    this.#approvalQueue = approvalQueue;
+    this.#account = account;
+    this.#kv = kv;
+    this.#draftId = draftId;
+  }
+
+  [Symbol.dispose]() {
+    this.#approvalQueue[Symbol.dispose]();
+  }
+
+  get #context(): DraftContext {
+    return { approvalQueue: this.#approvalQueue, account: this.#account, kv: this.#kv };
+  }
+
+  async getMetadata(): Promise<FastmailDraftInfo> {
+    const { record, content, at } = currentDraft(this.#kv, this.#draftId);
+    await this.#approvalQueue.authorizeObservation({
+      title: "Read Fastmail draft",
+      description: "Read a draft's addressees and subject.",
+    });
+    return toDraftInfo(record, content, at);
+  }
+
+  async getContent(): Promise<{ text?: string; html?: string }> {
+    const { content } = currentDraft(this.#kv, this.#draftId);
+    await this.#approvalQueue.authorizeObservation({
+      title: "Read Fastmail draft",
+      description: "Read a draft's body.",
+    });
+    const result: { text?: string; html?: string } = {};
+    if (content.textBody !== undefined) result.text = content.textBody;
+    if (content.htmlBody !== undefined) result.html = content.htmlBody;
+    return result;
+  }
+
+  async update(patch: FastmailDraftPatch): Promise<void> {
+    const { record, content } = currentDraft(this.#kv, this.#draftId);
+    const next: DraftContent = { ...content };
+    if (patch.to !== undefined) next.to = toJmapAddresses(patch.to) ?? [];
+    if (patch.cc !== undefined) next.cc = toJmapAddresses(patch.cc);
+    if (patch.bcc !== undefined) next.bcc = toJmapAddresses(patch.bcc);
+    if (patch.subject !== undefined) next.subject = patch.subject;
+    if (patch.text !== undefined) next.textBody = patch.text;
+    if (patch.html === null) delete next.htmlBody;
+    else if (patch.html !== undefined) next.htmlBody = patch.html;
+    await stageDraftRevision(
+      this.#context, record, { kind: "content", content: next, at: Date.now() }, "Edit email draft",
+      describeSend(
+        "Replace this draft in the Drafts folder with the content below. Nothing is sent.",
+        { from: record.from, ...next }),
+      AUTO_APPROVABLE_KINDS.draftUpdate);
+  }
+
+  async delete(): Promise<void> {
+    const { record, content } = currentDraft(this.#kv, this.#draftId);
+    await stageDraftRevision(
+      this.#context, record, { kind: "deleted", at: Date.now() }, "Discard email draft",
+      describeSend(
+        "Permanently discard this draft from the Drafts folder without sending it.",
+        { from: record.from, ...content }),
+      AUTO_APPROVABLE_KINDS.draftDelete);
+  }
+
+  async send(): Promise<void> {
+    const grant = await this.#account.getGrant();
+    const from = requireSender(grant);
+    const { record, content } = currentDraft(this.#kv, this.#draftId);
+    if (content.to.length === 0 && !content.cc?.length && !content.bcc?.length) {
+      throw new FastmailError("INVALID_RESOURCE", "This draft has no recipients to send it to.");
+    }
+    const params: SendEmailParams = { ...content, from };
+    // No action kind: sending is never auto-approved.
+    await stageDraftRevision(
+      this.#context, record, { kind: "sent", params, at: Date.now() }, "Send email draft",
+      describeSend("Send this draft, exactly as shown, from this Fastmail account. Sending can't be undone.", params),
+      undefined);
   }
 }

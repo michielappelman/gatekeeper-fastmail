@@ -36,7 +36,9 @@ The starter's `workers.fastmail.name` is the deployed Worker identity; it need n
 `gatekeeper-fastmail`. The public router is the only route: the Fastmail Worker should have no
 public or preview URL. Users paste their own Fastmail API token through the Gatekeeper's connect
 flow, so no deployment-wide Fastmail secret is required. Tokens should be scoped to Mail, with
-Email submission only when a connection needs `send()`.
+Email submission only when a connection needs to send. A token without Email submission gives a
+draft-only connection: the agent can prepare drafts for the user to send from Fastmail, and Fastmail
+itself refuses any attempt to send (see [Drafts and sending](#drafts-and-sending)).
 
 For local development and tests, run them from the consuming starter after the Cloudflare OS
 submodule is initialized:
@@ -92,12 +94,13 @@ just confirms what's being connected and reports the fixed resource URL, the sam
 ## Session API
 
 See `types.d.ts` for the full agent-facing surface: `FastmailSession.listFolders/listThreads/
-searchThreads/getThread/send`, and `FastmailThread.messages/readAttachment/moveToFolder/addKeyword/
-removeKeyword/markRead/markUnread`. Deliberately no Gmail-style `archive()`/`trash()` convenience
-verbs — call `listFolders()`, find the folder whose `role` is `"archive"`/`"trash"`, and pass its id
-to `moveToFolder()`.
+searchThreads/getThread/send/createDraft/listDrafts/getDraft`, `FastmailThread.messages/reply/
+createReplyDraft/readAttachment/moveToFolder/addKeyword/removeKeyword/markRead/markUnread`, and
+`FastmailSendableDraft.getMetadata/getContent/update/delete/send`. Deliberately no Gmail-style
+`archive()`/`trash()` convenience verbs — call `listFolders()`, find the folder whose `role` is
+`"archive"`/`"trash"`, and pass its id to `moveToFolder()`.
 
-Every mutation (a thread patch, or `send()`) is queued via `ApprovalQueue.submitAction()` and only
+Every mutation (a thread patch, a draft change, or a send) is queued via `ApprovalQueue.submitAction()` and only
 actually reaches Fastmail once `FastmailGatekeeperImpl.applyAction()` is called on approval — so
 `send()` returns once the send is *queued*, not once the message has left the account, matching
 `JottacloudFileSession.write()`'s contract rather than a synchronous send. A thread patch
@@ -111,6 +114,42 @@ the full plain-text body, and the HTML body, including the one derived from the 
 agent gave none. Such a description is marked complete. A thread change lists the messages it
 touches (date, sender, subject) and the target folder or keyword.
 
+## Drafts and sending
+
+Drafts give the agent a way to prepare mail without sending it. `createDraft()` and
+`FastmailThread.createReplyDraft()` save a message in the account's Drafts folder (`Email/set` with
+`$draft`, no `EmailSubmission`), where the user can review, edit and send it in Fastmail. A draft
+keeps a stable gatekeeper-assigned id across edits, because JMAP Emails are immutable apart from
+keywords and mailboxes (RFC 8621 §4.6): every applied edit replaces the Email in one `Email/set`
+(create the new copy, destroy the old one).
+
+Each draft change is stored as a revision keyed by its action id (`cache.ts`, `drafts.ts`). The agent
+always sees the newest revision, pending or applied, so it can keep editing without waiting for
+approval. Applying a revision older than the one already applied is a no-op, so approvals arriving
+out of order never overwrite newer content; rejecting a revision falls back to the newest remaining
+one. `listDrafts()` covers the drafts created through this connection, not drafts the user wrote in
+Fastmail (those are readable as threads in the Drafts folder), and edits the user makes to a draft
+in Fastmail are not reflected back.
+
+Sending a draft queues the exact content the agent sees as a snapshot. On approval the gatekeeper
+submits that snapshot as a fresh Email and then discards the stored copy, so what leaves the account
+is what the approver saw, even if the copy in Drafts changed meanwhile.
+
+**Auto-approval.** `getAutoApprovableActions()` lists the kinds a user may opt in to approving
+automatically: creating, editing and discarding drafts (`draftCreate`, `draftUpdate`,
+`draftDelete`), read state (`readState`), keywords (`keyword`) and folder moves (`move`). Sending
+(`send()`, `reply()`, a draft's `send()`) carries no action kind, so it always waits for a person.
+Auto-approving the three draft kinds gives "the agent may prepare drafts, but nothing is sent
+without me".
+
+**Draft-only connections.** With a token that lacks Email submission, `describe()` advertises
+`FastmailDraftOnlySession` instead of `FastmailSession`: the same surface without `send()`,
+`reply()`, or a draft's `send()`. The runtime still refuses those calls (`requireSender()`), and
+Fastmail refuses `EmailSubmission/set` for such a token regardless, so this mode is enforced by the
+provider, not only by the gatekeeper. Drafts on such a connection use the JMAP session's `username`
+as their From address when no sending identity is available. Grants stored before `username` was
+recorded leave From unset on such drafts until the account is reconnected.
+
 ## Observers
 
 Strategy A (private-only, see `write-gatekeeper` skill "Observer verification"): a personal mailbox
@@ -120,6 +159,7 @@ has no per-observer ACL Fastmail exposes to check a second connected account aga
 ## Current scope
 
 - Resource scope is the whole mailbox; per-folder and per-search binding selection is not exposed.
+- Drafts and sends carry no attachments.
 - Token rotation is handled by reconnecting with a new token; there is no refresh-token cycle.
 - Fastmail is not a sign-in identity provider (`getAuthenticatedEmail()` returns `null`), even though
   the connected account's own address is knowable.

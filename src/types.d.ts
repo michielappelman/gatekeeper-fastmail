@@ -73,11 +73,80 @@ export type FastmailMessage = {
   keywords: string[];
 };
 
+/** Recipients, subject and body of a new draft. Every field may be left out and filled in later
+ * with `FastmailDraft.update()`. Passing only `text` (no `html`) still produces a normally-formatted
+ * message: a simple HTML version is derived from it automatically. */
+export type FastmailDraftInput = {
+  to?: FastmailAddress[];
+  cc?: FastmailAddress[];
+  bcc?: FastmailAddress[];
+  subject?: string;
+  text?: string;
+  html?: string;
+};
+
+/** Fields to replace on a draft. Omitted fields stay as they are; `html: null` removes an explicit
+ * HTML body so it is derived from `text` again. */
+export type FastmailDraftPatch = {
+  to?: FastmailAddress[];
+  cc?: FastmailAddress[];
+  bcc?: FastmailAddress[];
+  subject?: string;
+  text?: string;
+  html?: string | null;
+};
+
+/** A draft's current addressees and subject. */
+export type FastmailDraftInfo = {
+  /** Pass this to `getDraft()`. It stays the same when the draft is edited. */
+  id: string;
+  to: FastmailAddress[];
+  cc: FastmailAddress[];
+  bcc: FastmailAddress[];
+  subject: string;
+  /** True for a draft created with `createReplyDraft()`: it stays in the original's thread. */
+  isReply: boolean;
+  /** When the draft was created or last edited. */
+  updatedAt: Date;
+};
+
 /**
- * Read-write access to one connected Fastmail account's whole mailbox. The account was chosen when
- * this connection was created and cannot be changed from here.
+ * A draft in the connected account's Drafts folder, created through this connection. The user can
+ * open, edit and send it from Fastmail; edits made there are not reflected here.
  */
-export interface FastmailSession {
+export interface FastmailDraft {
+  /** The draft's current addressees and subject. Throws `RESOURCE_NOT_FOUND` once it is deleted or
+   * sent. */
+  getMetadata(): Promise<FastmailDraftInfo>;
+
+  /** The draft's plain-text and HTML bodies, as far as they have been written. */
+  getContent(): Promise<{ text?: string; html?: string }>;
+
+  /** Replaces the given fields, keeping the rest. A reply draft keeps its threading. */
+  update(patch: FastmailDraftPatch): Promise<void>;
+
+  /** Discards the draft without sending it. */
+  delete(): Promise<void>;
+}
+
+/** A draft that can also be sent from here. */
+export interface FastmailSendableDraft extends FastmailDraft {
+  /**
+   * Queues this draft, exactly as it currently reads, to be sent; it then leaves the Drafts folder
+   * and can no longer be edited. Like `FastmailSession.send()`, this resolves once the send is
+   * queued, not once the message has left the account. Requires at least one To, Cc or Bcc
+   * recipient.
+   */
+  send(): Promise<void>;
+}
+
+/**
+ * Access to one connected Fastmail account's whole mailbox, for an account that can prepare drafts
+ * but not send mail: read, search and organize email, and write drafts for the user to review and
+ * send from Fastmail. The account was chosen when this connection was created and cannot be changed
+ * from here.
+ */
+export interface FastmailDraftOnlySession {
   /** Lists every folder in the mailbox. */
   listFolders(): Promise<FastmailFolder[]>;
 
@@ -110,7 +179,31 @@ export interface FastmailSession {
   searchThreads(query: string, folderId?: string): Promise<Cursor<FastmailThreadEntry>>;
 
   /** Opens one thread by id (from a `FastmailThreadEntry.threadId`). */
+  getThread(threadId: string): Promise<FastmailDraftOnlyThread>;
+
+  /** Creates a new draft in the Drafts folder. Nothing is sent. */
+  createDraft(draft: FastmailDraftInput): Promise<FastmailDraft>;
+
+  /** Lists the drafts created through this connection that are still drafts, oldest first. */
+  listDrafts(): Promise<FastmailDraftInfo[]>;
+
+  /** Reopens a draft by its `FastmailDraftInfo.id`. */
+  getDraft(id: string): Promise<FastmailDraft>;
+}
+
+/**
+ * Read-write access to one connected Fastmail account's whole mailbox, including sending mail. The
+ * account was chosen when this connection was created and cannot be changed from here.
+ */
+export interface FastmailSession extends FastmailDraftOnlySession {
+  /** Opens one thread by id (from a `FastmailThreadEntry.threadId`). */
   getThread(threadId: string): Promise<FastmailThread>;
+
+  /** Creates a new draft in the Drafts folder. Nothing is sent until you call its `send()`. */
+  createDraft(draft: FastmailDraftInput): Promise<FastmailSendableDraft>;
+
+  /** Reopens a draft by its `FastmailDraftInfo.id`. */
+  getDraft(id: string): Promise<FastmailSendableDraft>;
 
   /**
    * Queues a new message to send. Like any other action here, sending may be held for approval
@@ -129,32 +222,19 @@ export interface FastmailSession {
   ): Promise<void>;
 }
 
-/** One email thread, with its messages. */
-export interface FastmailThread {
+/** One email thread, with its messages, in an account that can prepare drafts but not send. */
+export interface FastmailDraftOnlyThread {
   /** All messages in this thread, oldest first. */
   messages(): Promise<FastmailMessage[]>;
 
   /**
-   * Queues a reply to this thread's most recent message, threaded properly (`In-Reply-To` and
-   * `References` are set, the subject gets a `Re:` prefix, and the original is marked
-   * `"$answered"` once sent). It goes to the original's Reply-To/From address; when the most recent
-   * message is one you sent, it goes to that message's recipients instead. `replyAll` also includes
-   * the original's other To/Cc recipients (never your own address). Like `send()`, this resolves
-   * once the reply is queued for approval, and throws `SUBMISSION_NOT_AUTHORIZED` if the token
-   * cannot send. Prefer this over `send()` whenever you are answering an existing message.
-   * Passing only `text` (no `html`) still sends a normally-formatted message: a simple HTML
-   * version is derived from it automatically.
-   *
-   * @example
-   * ```ts
-   * const thread = await session.getThread(entry.threadId);
-   * await thread.reply({ text: "Thanks, see you then!" });
-   * ```
+   * Creates a draft reply to this thread's most recent message, threaded and addressed the same
+   * way `FastmailThread.reply()` addresses a reply, with a `Re:` subject. Nothing is sent.
    */
-  reply(
+  createReplyDraft(
     body: { text?: string; html?: string },
     options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
-  ): Promise<void>;
+  ): Promise<FastmailDraft>;
 
   /** Downloads one attachment's content, by the `blobId` from `FastmailMessage.attachments`. */
   readAttachment(blobId: string): Promise<ArrayBuffer>;
@@ -187,4 +267,38 @@ export interface FastmailThread {
 
   /** Marks every message in this thread as unread (removes the `"$seen"` keyword). */
   markUnread(): Promise<void>;
+}
+
+/** One email thread, with its messages. */
+export interface FastmailThread extends FastmailDraftOnlyThread {
+  /**
+   * Queues a reply to this thread's most recent message, threaded properly (`In-Reply-To` and
+   * `References` are set, the subject gets a `Re:` prefix, and the original is marked
+   * `"$answered"` once sent). It goes to the original's Reply-To/From address; when the most recent
+   * message is one you sent, it goes to that message's recipients instead. `replyAll` also includes
+   * the original's other To/Cc recipients (never your own address). Like `send()`, this resolves
+   * once the reply is queued for approval, and throws `SUBMISSION_NOT_AUTHORIZED` if the token
+   * cannot send. Prefer this over `send()` whenever you are answering an existing message.
+   * Passing only `text` (no `html`) still sends a normally-formatted message: a simple HTML
+   * version is derived from it automatically.
+   *
+   * @example
+   * ```ts
+   * const thread = await session.getThread(entry.threadId);
+   * await thread.reply({ text: "Thanks, see you then!" });
+   * ```
+   */
+  reply(
+    body: { text?: string; html?: string },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+  ): Promise<void>;
+
+  /**
+   * Creates a draft reply to this thread's most recent message, addressed and threaded exactly as
+   * `reply()` would send it. Nothing is sent until you call its `send()`.
+   */
+  createReplyDraft(
+    body: { text?: string; html?: string },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+  ): Promise<FastmailSendableDraft>;
 }
