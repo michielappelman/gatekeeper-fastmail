@@ -464,10 +464,15 @@ export type AttachmentRef =
   | { kind: "new"; filename: string; mimeType: string; size: number; sha256: string }
   /** An attachment already in the account: a blob of message `fromEmailId`. `source` names that
    * message for the approver. */
-  | { kind: "existing"; filename: string; mimeType: string; size: number; blobId: string; fromEmailId: string; source: string };
+  | {
+      kind: "existing"; filename: string; mimeType: string; size: number; blobId: string; fromEmailId: string;
+      source: string;
+      /** For a forward: the original's inline image, kept inline so the quoted HTML still shows it. */
+      cid?: string;
+    };
 
 /** An attachment as it goes on the Email, once uploaded. */
-export type UploadedBlob = { blobId: string; type: string; name: string };
+export type UploadedBlob = { blobId: string; type: string; name: string; cid?: string };
 
 /** The account-specific ids a send needs, resolved at apply time by `resolveSendContext()`. */
 export type SendContext = {
@@ -572,7 +577,9 @@ function draftEmailCreate(
     textBody: textBody.length > 0 ? textBody : undefined,
     htmlBody: htmlBody.length > 0 ? htmlBody : undefined,
     attachments: params.attachmentBlobs?.length
-      ? params.attachmentBlobs.map(blob => ({ blobId: blob.blobId, type: blob.type, name: blob.name, disposition: "attachment" }))
+      ? params.attachmentBlobs.map(blob => blob.cid
+        ? { blobId: blob.blobId, type: blob.type, name: blob.name, disposition: "inline", cid: blob.cid }
+        : { blobId: blob.blobId, type: blob.type, name: blob.name, disposition: "attachment" })
       : undefined,
   };
 }

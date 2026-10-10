@@ -89,6 +89,17 @@ export type FastmailOutgoingAttachment =
   | { filename: string; mimeType: string; content: ArrayBuffer }
   | { fromMessageId: string; blobId: string; filename?: string };
 
+/** Recipients and attachments of a forward. */
+export type FastmailForwardOptions = {
+  cc?: FastmailAddress[];
+  bcc?: FastmailAddress[];
+  /** Whether to include the original's attachments (and inline images). Default `true`. They count
+   * towards the 10 MiB limit; pass `false` to forward only the text. */
+  includeAttachments?: boolean;
+  /** Further attachments to add. */
+  attachments?: FastmailOutgoingAttachment[];
+};
+
 /** An attachment on a draft. */
 export type FastmailDraftAttachment = { filename: string; mimeType: string; size: number };
 
@@ -128,6 +139,8 @@ export type FastmailDraftInfo = {
   subject: string;
   /** True for a draft created with `createReplyDraft()`: it stays in the original's thread. */
   isReply: boolean;
+  /** True for a draft created with `createForwardDraft()`. */
+  isForward: boolean;
   attachments: FastmailDraftAttachment[];
   /** When the draft was created or last edited. */
   updatedAt: Date;
@@ -472,9 +485,17 @@ export interface FastmailDraftOnlyMessageRef {
     body: { text?: string; html?: string },
     options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<FastmailDraft>;
+  /**
+   * Creates a draft forwarding this message to `to`: subject "Fwd: ...", your optional note, then
+   * the original under a "Forwarded message" block with its From, Date, Subject and To, in plain
+   * text and HTML, with the original's attachments. Nothing is sent.
+   */
+  createForwardDraft(
+    to: FastmailAddress[], body?: { text?: string; html?: string }, options?: FastmailForwardOptions,
+  ): Promise<FastmailDraft>;
 }
 
-/** One message: read it, organize just this message, or reply to it. */
+/** One message: read it, organize just this message, reply to it, or forward it. */
 export interface FastmailMessageRef extends FastmailDraftOnlyMessageRef {
   /** The message's thread, as far as this connection can see it. */
   thread(): Promise<FastmailThread>;
@@ -490,6 +511,23 @@ export interface FastmailMessageRef extends FastmailDraftOnlyMessageRef {
   createReplyDraft(
     body: { text?: string; html?: string },
     options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
+  ): Promise<FastmailSendableDraft>;
+  /**
+   * Queues this message to be forwarded to `to`, as `createForwardDraft()` describes; the original
+   * is marked `"$forwarded"` once it is sent. Resolves once the forward is queued.
+   *
+   * @example
+   * ```ts
+   * const message = await session.getMessage(id);
+   * await message.forward([{ email: "accountant@example.com" }], { text: "Invoice for October." });
+   * ```
+   */
+  forward(
+    to: FastmailAddress[], body?: { text?: string; html?: string }, options?: FastmailForwardOptions,
+  ): Promise<void>;
+  /** As `FastmailDraftOnlyMessageRef.createForwardDraft()`, with a draft that can also be sent. */
+  createForwardDraft(
+    to: FastmailAddress[], body?: { text?: string; html?: string }, options?: FastmailForwardOptions,
   ): Promise<FastmailSendableDraft>;
 }
 

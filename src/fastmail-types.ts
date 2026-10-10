@@ -44,6 +44,9 @@ export type JmapAttachment = {
   type: string;
   name: string | null;
   size: number;
+  /** Set for a part the HTML body shows inline, referenced as `cid:<cid>`. */
+  cid?: string | null;
+  disposition?: string | null;
 };
 
 /** One JMAP Email object (`Email/get`), narrowed to the properties this gatekeeper requests. */
@@ -58,8 +61,8 @@ export type JmapEmailObject = {
   subject: string | null;
   receivedAt: string;
   preview: string;
-  textBody?: { partId: string | null }[];
-  htmlBody?: { partId: string | null }[];
+  textBody?: { partId: string | null; type?: string }[];
+  htmlBody?: { partId: string | null; type?: string }[];
   bodyValues?: Record<string, JmapBodyValue>;
   attachments?: JmapAttachment[];
   /** The `Message-ID` header's ids, without angle brackets; only when requested. */

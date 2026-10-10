@@ -208,6 +208,24 @@ content or the date, sender and subject of the message an existing one comes fro
 `FastmailDraftInfo.attachments` lists a draft's attachments; `update({ attachments })` replaces them
 (`null` or `[]` removes them all).
 
+## Forwarding
+
+`FastmailMessageRef.forward(to, body?, options?)` and `createForwardDraft()` forward one message:
+subject "Fwd: …" (kept when it already starts with Fwd:/Fw:), the caller's optional note, then the
+original under a "---------- Forwarded message ----------" block with its From, Date, Subject, To
+and Cc. The plain-text part quotes the original's text (or a text rendering of its HTML); when the
+original has HTML, the HTML part quotes its `<body>` in a `<blockquote type="cite">`. A forward is a
+new message: it carries no In-Reply-To or References.
+
+The original's attachments are attached by blob id, with no download or upload (see
+[Attachments](#attachments)); its inline images keep `disposition: inline` and their `cid`, so the
+quoted HTML still shows them. They count towards the 10 MiB limit; `includeAttachments: false`
+leaves them out, and `attachments` adds more. Once a forward is sent, the original gets the
+`$forwarded` keyword (best-effort, like `$answered` on replies).
+
+A folder or search binding may forward a message in its scope, as Gmail's label and search bindings
+can; like every send, it waits for approval and is never auto-approved.
+
 ## New-mail hooks
 
 `subscribeNewMessages(hook, { folderId? })` binds a hook that is called with each new message

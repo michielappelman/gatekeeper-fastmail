@@ -123,7 +123,7 @@ export async function uploadAttachments(
   const blobs: UploadedBlob[] = [];
   for (const ref of refs) {
     if (ref.kind === "existing") {
-      blobs.push({ blobId: ref.blobId, type: ref.mimeType, name: ref.filename });
+      blobs.push({ blobId: ref.blobId, type: ref.mimeType, name: ref.filename, ...ref.cid ? { cid: ref.cid } : {} });
       continue;
     }
     const content = loadContent(kv, ref.sha256);

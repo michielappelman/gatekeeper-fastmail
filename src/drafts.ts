@@ -59,6 +59,7 @@ export function toDraftInfo(record: DraftRecord, content: DraftContent, at: numb
     bcc: toAgentAddresses(content.bcc),
     subject: content.subject,
     isReply: record.answersEmailId !== undefined,
+    isForward: record.forwardsEmailId !== undefined,
     attachments: attachmentSummaries(content.attachments),
     updatedAt: new Date(at),
   };
@@ -127,6 +128,12 @@ export async function applyDraftRevision(
     if (previousEmailId) {
       await destroyEmails(apiUrl, apiToken, accountId, hasSubmission, [previousEmailId], fetchImpl)
         .catch(error => logCleanupFailure("draftCleanupFailed", error, actionId));
+    }
+    if (record.forwardsEmailId) {
+      await updateEmails(
+        apiUrl, apiToken, accountId, hasSubmission, [record.forwardsEmailId],
+        { "keywords/$forwarded": true }, fetchImpl,
+      ).catch(error => logCleanupFailure("markForwardedFailed", error, actionId));
     }
     if (record.answersEmailId) {
       await updateEmails(

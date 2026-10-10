@@ -74,6 +74,7 @@ import {
   queryThreadPage,
   resolveSendContext,
   sendEmail,
+  textToHtml,
   updateEmails,
   type FastmailAccountInfo,
   type JmapReplySource,
@@ -901,14 +902,16 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
       for (const emailId of pending.emailIds) {
         clearSimulatedKeywordsIfLatest(this.ctx.storage.kv, emailId, actionId);
       }
-    } else if (pending.kind === "send" && pending.answersEmailId) {
-      // Best-effort, after the record is gone: the reply has already been sent, so failing (or
-      // retrying) the approval over a missing "$answered" flag would be worse than the flag.
+    } else if (pending.kind === "send" && (pending.answersEmailId || pending.forwardsEmailId)) {
+      // Best-effort, after the record is gone: the message has already been sent, so failing (or
+      // retrying) the approval over a missing "$answered"/"$forwarded" flag would be worse.
       const grant = await this.#userAccount().getGrant();
+      const [emailId, keyword] = pending.answersEmailId
+        ? [pending.answersEmailId, "$answered"] : [pending.forwardsEmailId!, "$forwarded"];
       await updateEmails(
-        grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, [pending.answersEmailId],
-        { "keywords/$answered": true },
-      ).catch(error => logError("apply.markAnsweredFailed", error, { actionId }));
+        grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, [emailId],
+        { [`keywords/${keyword}`]: true },
+      ).catch(error => logError("apply.markOriginalFailed", error, { actionId }));
     }
   }
 
@@ -1073,6 +1076,82 @@ function replyContent(
   };
 }
 
+/** Options of `forward()` and `createForwardDraft()`. */
+type ForwardOptions = {
+  cc?: FastmailAddress[];
+  bcc?: FastmailAddress[];
+  includeAttachments?: boolean;
+  attachments?: FastmailOutgoingAttachment[];
+};
+
+/**
+ * The params of a forward of `original`, as `forward()` sends it and `createForwardDraft()` saves it:
+ * a "Fwd:" subject, the caller's note followed by the original under a "Forwarded message" header
+ * block, in both plain text and (when the original has one) HTML. Attachments are added by the caller.
+ */
+function forwardContent(
+  original: JmapEmailObject, to: FastmailAddress[], body: { text?: string; html?: string } | undefined,
+  options: ForwardOptions | undefined,
+): DraftContent {
+  if (to.length === 0 && !options?.cc?.length && !options?.bcc?.length) {
+    throw new FastmailError("INVALID_RESOURCE", "A forward needs at least one To, Cc or Bcc recipient.");
+  }
+  const subject = original.subject ?? "";
+  const headers: [string, string][] = [
+    ["From", formatAddresses(original.from)],
+    ["Date", new Date(original.receivedAt).toUTCString()],
+    ["Subject", subject],
+    ["To", formatAddresses(original.to)],
+  ];
+  if (original.cc?.length) headers.push(["Cc", formatAddresses(original.cc)]);
+  // JMAP falls back to the other kind when a message has only one: a text-only message's htmlBody
+  // is its text/plain part, and an HTML-only message's textBody its text/html part.
+  const textPart = original.textBody?.find(part => part.type !== "text/html")?.partId;
+  const htmlPart = original.htmlBody?.find(part => part.type === "text/html")?.partId;
+  const originalText = textPart ? original.bodyValues?.[textPart]?.value : undefined;
+  const originalHtml = htmlPart ? original.bodyValues?.[htmlPart]?.value : undefined;
+
+  const note = body?.text ?? (body?.html !== undefined ? htmlToText(body.html) : "");
+  const textBody = `${note ? `${note}\n\n` : ""}---------- Forwarded message ----------\n` +
+    `${headers.map(([name, value]) => `${name}: ${value}`).join("\n")}\n\n` +
+    `${originalText ?? (originalHtml !== undefined ? htmlToText(originalHtml) : original.preview)}`;
+  let htmlBody: string | undefined;
+  if (originalHtml !== undefined || body?.html !== undefined) {
+    const quoted = originalHtml !== undefined ? htmlBodyContent(originalHtml) : textToHtml(originalText ?? original.preview);
+    htmlBody = `${body?.html ?? (note ? textToHtml(note) : "")}\n` +
+      `<div>---------- Forwarded message ----------<br>\n` +
+      `${headers.map(([name, value]) => `${name}: ${escapeHtml(value)}`).join("<br>\n")}</div>\n` +
+      `<blockquote type="cite" style="margin: 0 0 0 0.8ex; border-left: 1px solid #ccc; padding-left: 1ex;">\n` +
+      `${quoted}\n</blockquote>`;
+  }
+  return {
+    to: toJmapAddresses(to) ?? [],
+    cc: toJmapAddresses(options?.cc),
+    bcc: toJmapAddresses(options?.bcc),
+    subject: /^(fwd?|fw):/i.test(subject.trim()) ? subject : `Fwd: ${subject}`,
+    textBody,
+    htmlBody,
+  };
+}
+
+/** The inside of an HTML document's `<body>`, or the whole fragment when it has none. */
+function htmlBodyContent(html: string): string {
+  return /<body[^>]*>([\s\S]*)<\/body>/i.exec(html)?.[1] ?? html;
+}
+
+/** A rough plain-text rendering of HTML, for the text part of a forward. */
+function htmlToText(html: string): string {
+  return htmlBodyContent(html)
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/(p|div|li|tr|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, "\"")
+    .replace(/&#39;/g, "'").replace(/&amp;/g, "&")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 // ---------------------------------------------------------------------------
 // Drafts, shared by FastmailSessionImpl, FastmailThreadImpl, and FastmailDraftImpl
 
@@ -1108,15 +1187,16 @@ async function stageDraftRevision(
 
 /** Creates a draft record for `content` and queues saving it to Drafts. */
 async function createDraftRecord(
-  ctx: DraftContext, from: string | undefined, content: DraftContent, answersEmailId?: string,
+  ctx: DraftContext, from: string | undefined, content: DraftContent,
+  origin: { answersEmailId?: string; forwardsEmailId?: string } = {},
 ): Promise<FastmailDraftImpl> {
-  const record: DraftRecord = { id: crypto.randomUUID(), from, answersEmailId, pending: {} };
+  const record: DraftRecord = { id: crypto.randomUUID(), from, ...origin, pending: {} };
+  const kind = origin.answersEmailId ? "reply " : origin.forwardsEmailId ? "forward " : "";
   await stageDraftRevision(
     ctx, record, { kind: "content", content, at: Date.now() },
-    answersEmailId ? "Save reply draft" : "Create email draft",
+    origin.answersEmailId ? "Save reply draft" : origin.forwardsEmailId ? "Save forward draft" : "Create email draft",
     describeSend(
-      `Save a new ${answersEmailId ? "reply " : ""}draft in this Fastmail account's Drafts folder. ` +
-      "Nothing is sent.",
+      `Save a new ${kind}draft in this Fastmail account's Drafts folder. Nothing is sent.`,
       { from, ...content }),
     AUTO_APPROVABLE_KINDS.draftCreate);
   return new FastmailDraftImpl(ctx.approvalQueue.dup(), ctx.account, ctx.kv, record.id, ctx.guard);
@@ -1124,7 +1204,7 @@ async function createDraftRecord(
 
 async function stageSend(
   approvalQueue: RpcStub<ApprovalQueue>, kv: DurableObjectStorage["kv"],
-  pending: { params: SendEmailParams; answersEmailId?: string }, title: string,
+  pending: { params: SendEmailParams; answersEmailId?: string; forwardsEmailId?: string }, title: string,
 ): Promise<void> {
   const actionId = nextActionId(kv);
   setPendingAction(kv, actionId, { kind: "send", ...pending });
@@ -1535,7 +1615,7 @@ class MessageSet {
       prepareAttachments(options?.attachments, { kv: this.ctx.kv, grant, guard: this.ctx.guard }));
     return createDraftRecord(
       { approvalQueue: this.ctx.approvalQueue, account: this.ctx.account, kv: this.ctx.kv, guard: this.ctx.guard },
-      from, { ...replyContent(source, from, body, options), attachments }, source.id);
+      from, { ...replyContent(source, from, body, options), attachments }, { answersEmailId: source.id });
   }
 
   /** The newest admitted message: what a reply answers. */
@@ -1880,6 +1960,59 @@ export class FastmailMessageRefImpl extends RpcTarget implements FastmailMessage
     options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<FastmailSendableDraft> {
     return this.#set.createReplyDraft(body, options);
+  }
+
+  /** The forward's content and attachments, from the original as it is now. */
+  async #forward(
+    grant: StoredGrant, to: FastmailAddress[], body: { text?: string; html?: string } | undefined,
+    options: ForwardOptions | undefined,
+  ): Promise<DraftContent> {
+    const [original] = await this.#set.emails(grant);
+    if (!original) throw outOfScope("That message");
+    const content = forwardContent(original, to, body, options);
+    const own = options?.includeAttachments === false ? [] : (original.attachments ?? []);
+    let attachments: Awaited<ReturnType<typeof prepareAttachments>>;
+    try {
+      attachments = await callFastmail(this.#ctx.account, () => prepareAttachments(
+        [...own.map(part => ({ fromMessageId: original.id, blobId: part.blobId })), ...options?.attachments ?? []],
+        { kv: this.#ctx.kv, grant, guard: this.#ctx.guard }));
+    } catch (error) {
+      if (own.length > 0 && error instanceof FastmailError && error.code === "INVALID_RESOURCE") {
+        throw new FastmailError("INVALID_RESOURCE",
+          `${error.message} The original's own attachments count too: pass includeAttachments: false to leave them out.`);
+      }
+      throw error;
+    }
+    // Keep the original's inline images inline, so the quoted HTML still shows them.
+    const inline = new Map(own.filter(part => part.cid && part.disposition === "inline")
+      .map(part => [part.blobId, part.cid!.replace(/^<|>$/g, "")]));
+    return {
+      ...content,
+      attachments: attachments?.map(ref => ref.kind === "existing" && ref.fromEmailId === original.id && inline.has(ref.blobId)
+        ? { ...ref, cid: inline.get(ref.blobId) } : ref),
+    };
+  }
+
+  async forward(
+    to: FastmailAddress[], body?: { text?: string; html?: string }, options?: ForwardOptions,
+  ): Promise<void> {
+    const grant = await this.#ctx.account.getGrant();
+    const from = requireSender(grant);
+    const content = await this.#forward(grant, to, body, options);
+    await stageSend(this.#ctx.approvalQueue, this.#ctx.kv, {
+      params: { from, ...content },
+      forwardsEmailId: this.#emailId,
+    }, "Forward email");
+  }
+
+  async createForwardDraft(
+    to: FastmailAddress[], body?: { text?: string; html?: string }, options?: ForwardOptions,
+  ): Promise<FastmailSendableDraft> {
+    const grant = await this.#ctx.account.getGrant();
+    const content = await this.#forward(grant, to, body, options);
+    return createDraftRecord(
+      { approvalQueue: this.#ctx.approvalQueue, account: this.#ctx.account, kv: this.#ctx.kv, guard: this.#ctx.guard },
+      draftSender(grant), content, { forwardsEmailId: this.#emailId });
   }
 }
 

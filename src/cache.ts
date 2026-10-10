@@ -91,6 +91,8 @@ export type PendingAction =
       params: SendEmailParams;
       /** For a reply: the email being answered, marked `$answered` once the reply is sent. */
       answersEmailId?: string;
+      /** For a forward: the email being forwarded, marked `$forwarded` once it is sent. */
+      forwardsEmailId?: string;
     };
 
 function pendingActionKey(actionId: number): string {
@@ -166,6 +168,8 @@ export type DraftRecord = {
   from?: string;
   /** For a reply draft: the email it answers, marked `$answered` once the draft is sent. */
   answersEmailId?: string;
+  /** For a forward draft: the email it forwards, marked `$forwarded` once the draft is sent. */
+  forwardsEmailId?: string;
   /** Submitted revisions not yet approved or rejected, keyed by action id. */
   pending: Record<string, DraftRevision>;
   /** The newest revision applied to Fastmail, and the Email holding it while it is content. */
