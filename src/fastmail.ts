@@ -56,6 +56,7 @@ import {
   setSimulatedKeywords,
 } from "./cache";
 import { applyDraftRevision, currentDraft, rejectDraftRevision, toDraftInfo } from "./drafts";
+import { collectAttachmentGarbage, prepareAttachments, uploadAttachments } from "./attachments";
 import { FastmailError } from "./errors";
 import { assertMarkdownConvertible, convertToMarkdown } from "./markdown";
 import {
@@ -108,6 +109,7 @@ import type {
   FastmailMessage,
   FastmailMessageEntry,
   FastmailMessageRef,
+  FastmailOutgoingAttachment,
   FastmailSendableDraft,
   FastmailSession,
   FastmailThread,
@@ -875,7 +877,8 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
         if (pending.kind === "send") {
           const context = await resolveSendContext(
             grant.apiUrl, grant.apiToken, grant.accountId, pending.params.from);
-          await sendEmail(grant.apiUrl, grant.apiToken, grant.accountId, pending.params, context);
+          const attachmentBlobs = await uploadAttachments(this.ctx.storage.kv, grant, pending.params.attachments);
+          await sendEmail(grant.apiUrl, grant.apiToken, grant.accountId, { ...pending.params, attachmentBlobs }, context);
         } else if (pending.kind === "draft") {
           await this.#withDraftLock(
             pending.draftId, () => applyDraftRevision(this.ctx.storage.kv, actionId, pending.draftId, grant));
@@ -893,6 +896,7 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
     }
 
     deletePendingAction(this.ctx.storage.kv, actionId);
+    this.#collectAttachments();
     if (pending.kind === "patch") {
       for (const emailId of pending.emailIds) {
         clearSimulatedKeywordsIfLatest(this.ctx.storage.kv, emailId, actionId);
@@ -941,13 +945,24 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
 
   /** Rejected: discard the queued side effect and its simulated view, if any. Nothing was ever sent
    * to Fastmail. */
+  /** Drops stored attachment content nothing pending references any more; never fails the caller. */
+  #collectAttachments(): void {
+    try {
+      collectAttachmentGarbage(this.ctx.storage.kv);
+    } catch (error) {
+      logError("attachments.gcFailed", error);
+    }
+  }
+
   async rejectAction(actionId: number): Promise<void> {
     const pending = getPendingAction(this.ctx.storage.kv, actionId);
     deletePendingAction(this.ctx.storage.kv, actionId);
     if (pending?.kind === "draft") {
       rejectDraftRevision(this.ctx.storage.kv, actionId, pending.draftId);
+      this.#collectAttachments();
       return;
     }
+    if (pending?.kind === "send") this.#collectAttachments();
     if (pending?.kind !== "patch") return;
     for (const emailId of pending.emailIds) {
       clearSimulatedKeywordsIfLatest(this.ctx.storage.kv, emailId, actionId);
@@ -1065,6 +1080,8 @@ type DraftContext = {
   approvalQueue: RpcStub<ApprovalQueue>;
   account: DurableObjectStub<UserAccount>;
   kv: DurableObjectStorage["kv"];
+  /** Which messages the draft may take existing attachments from. */
+  guard: ScopeGuard;
 };
 
 /**
@@ -1102,7 +1119,7 @@ async function createDraftRecord(
       "Nothing is sent.",
       { from, ...content }),
     AUTO_APPROVABLE_KINDS.draftCreate);
-  return new FastmailDraftImpl(ctx.approvalQueue.dup(), ctx.account, ctx.kv, record.id);
+  return new FastmailDraftImpl(ctx.approvalQueue.dup(), ctx.account, ctx.kv, record.id, ctx.guard);
 }
 
 async function stageSend(
@@ -1285,19 +1302,23 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
 
   async send(
     to: FastmailAddress[], subject: string, body: { text?: string; html?: string },
-    options?: { cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<void> {
     this.#guard.requireWholeMailbox("send new mail");
     const grant = await this.#account.getGrant();
+    const from = requireSender(grant);
+    const attachments = await this.#call(() =>
+      prepareAttachments(options?.attachments, { kv: this.#kv, grant, guard: this.#guard }));
     await stageSend(this.#approvalQueue, this.#kv, {
       params: {
-        from: requireSender(grant),
+        from,
         to: toJmapAddresses(to) ?? [],
         cc: toJmapAddresses(options?.cc),
         bcc: toJmapAddresses(options?.bcc),
         subject,
         textBody: body.text,
         htmlBody: body.html,
+        attachments,
       },
     }, "Send email");
   }
@@ -1305,8 +1326,10 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
   async createDraft(draft: FastmailDraftInput): Promise<FastmailSendableDraft> {
     this.#guard.requireWholeMailbox("draft new mail");
     const grant = await this.#account.getGrant();
+    const attachments = await this.#call(() =>
+      prepareAttachments(draft.attachments, { kv: this.#kv, grant, guard: this.#guard }));
     return createDraftRecord(
-      { approvalQueue: this.#approvalQueue, account: this.#account, kv: this.#kv },
+      { approvalQueue: this.#approvalQueue, account: this.#account, kv: this.#kv, guard: this.#guard },
       draftSender(grant), {
         to: toJmapAddresses(draft.to) ?? [],
         cc: toJmapAddresses(draft.cc),
@@ -1314,6 +1337,7 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
         subject: draft.subject ?? "",
         textBody: draft.text,
         htmlBody: draft.html,
+        attachments,
       });
   }
 
@@ -1334,7 +1358,7 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
 
   async getDraft(id: string): Promise<FastmailSendableDraft> {
     currentDraft(this.#kv, id);
-    return new FastmailDraftImpl(this.#approvalQueue.dup(), this.#account, this.#kv, id);
+    return new FastmailDraftImpl(this.#approvalQueue.dup(), this.#account, this.#kv, id, this.#guard);
   }
 
   async subscribeNewMessages(
@@ -1487,27 +1511,31 @@ class MessageSet {
 
   async reply(
     body: { text?: string; html?: string },
-    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<void> {
     const grant = await this.ctx.account.getGrant();
     const from = requireSender(grant);
     const source = await this.#replySource(grant);
+    const attachments = await this.#call(() =>
+      prepareAttachments(options?.attachments, { kv: this.ctx.kv, grant, guard: this.ctx.guard }));
     await stageSend(this.ctx.approvalQueue, this.ctx.kv, {
-      params: { from, ...replyContent(source, from, body, options) },
+      params: { from, ...replyContent(source, from, body, options), attachments },
       answersEmailId: source.id,
     }, "Reply to email");
   }
 
   async createReplyDraft(
     body: { text?: string; html?: string },
-    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<FastmailSendableDraft> {
     const grant = await this.ctx.account.getGrant();
     const from = draftSender(grant);
     const source = await this.#replySource(grant);
+    const attachments = await this.#call(() =>
+      prepareAttachments(options?.attachments, { kv: this.ctx.kv, grant, guard: this.ctx.guard }));
     return createDraftRecord(
-      { approvalQueue: this.ctx.approvalQueue, account: this.ctx.account, kv: this.ctx.kv },
-      from, replyContent(source, from, body, options), source.id);
+      { approvalQueue: this.ctx.approvalQueue, account: this.ctx.account, kv: this.ctx.kv, guard: this.ctx.guard },
+      from, { ...replyContent(source, from, body, options), attachments }, source.id);
   }
 
   /** The newest admitted message: what a reply answers. */
@@ -1708,14 +1736,14 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
 
   reply(
     body: { text?: string; html?: string },
-    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<void> {
     return this.#set.reply(body, options);
   }
 
   createReplyDraft(
     body: { text?: string; html?: string },
-    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<FastmailSendableDraft> {
     return this.#set.createReplyDraft(body, options);
   }
@@ -1842,14 +1870,14 @@ export class FastmailMessageRefImpl extends RpcTarget implements FastmailMessage
 
   reply(
     body: { text?: string; html?: string },
-    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<void> {
     return this.#set.reply(body, options);
   }
 
   createReplyDraft(
     body: { text?: string; html?: string },
-    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<FastmailSendableDraft> {
     return this.#set.createReplyDraft(body, options);
   }
@@ -1864,15 +1892,18 @@ export class FastmailDraftImpl extends RpcTarget implements FastmailSendableDraf
   #account: DurableObjectStub<UserAccount>;
   #kv: DurableObjectStorage["kv"];
   #draftId: string;
+  #guard: ScopeGuard;
 
+  /** `guard` is required: it decides which messages' attachments this draft may take. */
   constructor(
       approvalQueue: RpcStub<ApprovalQueue>, account: DurableObjectStub<UserAccount>,
-      kv: DurableObjectStorage["kv"], draftId: string) {
+      kv: DurableObjectStorage["kv"], draftId: string, guard: ScopeGuard) {
     super();
     this.#approvalQueue = approvalQueue;
     this.#account = account;
     this.#kv = kv;
     this.#draftId = draftId;
+    this.#guard = guard;
   }
 
   [Symbol.dispose]() {
@@ -1880,7 +1911,7 @@ export class FastmailDraftImpl extends RpcTarget implements FastmailSendableDraf
   }
 
   get #context(): DraftContext {
-    return { approvalQueue: this.#approvalQueue, account: this.#account, kv: this.#kv };
+    return { approvalQueue: this.#approvalQueue, account: this.#account, kv: this.#kv, guard: this.#guard };
   }
 
   async getMetadata(): Promise<FastmailDraftInfo> {
@@ -1914,6 +1945,12 @@ export class FastmailDraftImpl extends RpcTarget implements FastmailSendableDraf
     if (patch.text !== undefined) next.textBody = patch.text;
     if (patch.html === null) delete next.htmlBody;
     else if (patch.html !== undefined) next.htmlBody = patch.html;
+    if (patch.attachments === null || patch.attachments?.length === 0) {
+      delete next.attachments;
+    } else if (patch.attachments !== undefined) {
+      const grant = await this.#account.getGrant();
+      next.attachments = await prepareAttachments(patch.attachments, { kv: this.#kv, grant, guard: this.#guard });
+    }
     await stageDraftRevision(
       this.#context, record, { kind: "content", content: next, at: Date.now() }, "Edit email draft",
       describeSend(

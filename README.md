@@ -183,6 +183,31 @@ provider, not only by the gatekeeper. Drafts on such a connection use the JMAP s
 as their From address when no sending identity is available. Grants stored before `username` was
 recorded leave From unset on such drafts until the account is reconnected.
 
+## Attachments
+
+Sends, replies, new drafts, reply drafts and draft edits take `attachments`
+(`FastmailOutgoingAttachment`): new content (`{ filename, mimeType, content: ArrayBuffer }`), or an
+attachment already in the account (`{ fromMessageId, blobId }`, from `FastmailMessage.attachments`).
+At most 20 per message and 10 MiB in total, existing ones included.
+
+Nothing reaches Fastmail before approval (`src/attachments.ts`):
+
+- **New content** is validated (filename kept to one line, a `type/subtype` MIME type), hashed, and
+  stored in the binding's Durable Object storage under its SHA-256, in 512 KiB chunks. Drafts and
+  sends record only a reference, so editing a draft doesn't copy its attachments. On approval the
+  content is uploaded to the JMAP upload endpoint (RFC 8620 §6.1) and the Email is created with the
+  returned blob ids; uploading any earlier would risk Fastmail discarding the unreferenced blob
+  before a slow approval, or leave blobs behind for a rejected one. Content no pending send or draft
+  references is deleted after every approval and rejection.
+- **An existing attachment** is attached by its blob id, with no upload. It is admitted only from a
+  message the binding's scope admits (`ScopeGuard`), so a folder or search binding can't attach files
+  from outside its scope, and only if the blob is one of that message's attachments.
+
+The approval lists every attachment with its filename, type and size, and the SHA-256 of new
+content or the date, sender and subject of the message an existing one comes from.
+`FastmailDraftInfo.attachments` lists a draft's attachments; `update({ attachments })` replaces them
+(`null` or `[]` removes them all).
+
 ## New-mail hooks
 
 `subscribeNewMessages(hook, { folderId? })` binds a hook that is called with each new message
@@ -243,7 +268,6 @@ has no per-observer ACL Fastmail exposes to check a second connected account aga
   not Fastmail's web search syntax.
 - New-mail hooks watch one folder each and report new mail only, not moves, flag changes or
   deletions.
-- Drafts and sends carry no attachments.
 - Token rotation is handled by reconnecting with a new token; there is no refresh-token cycle.
 - Fastmail is not a sign-in identity provider (`getAuthenticatedEmail()` returns `null`), even though
   the connected account's own address is knowable.

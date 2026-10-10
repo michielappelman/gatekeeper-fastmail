@@ -49,6 +49,7 @@ src/errors.ts         Stable FastmailErrorCode mapping
 src/hooks.ts          New-mail hooks: controller, per-connection driver DO, push route
 src/hook-delivery-queue.ts  Per-hook retrying delivery queue (copied from gatekeeper-google)
 src/webpush.ts        Web Push (RFC 8291 aes128gcm) key generation and decryption
+src/attachments.ts    Outgoing attachments: stored by SHA-256 until approval, uploaded on apply
 src/configurator/     Zero-field whole-mailbox configurator source/types
 __tests__/             JMAP, resource, cache, and configurator tests
 ```
@@ -128,6 +129,10 @@ mocked `fetch`; no Fastmail credentials belong in the repository.
   latest overlay for that email.
 - Folder moves do not have a simulated folder-membership view.
 - Sends have no simulation and are irreversible; `send()` resolves when queued, not when delivered.
+- Attachment content must never be uploaded before approval: it is stored in the binding's storage
+  and uploaded in `applyAction()`/`applyDraftRevision()`. An existing attachment (by blob id) must
+  come from a message the binding's `ScopeGuard` admits; `FastmailDraftImpl` always carries the
+  guard for this.
 - Drafts have a stable gatekeeper id (`draft:<id>` records) because every applied edit replaces the
   JMAP Email. Each draft change is a revision keyed by action id; the agent sees the newest one,
   applying a revision older than the applied one is a no-op, and rejecting one falls back to the

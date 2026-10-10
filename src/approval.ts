@@ -31,6 +31,11 @@ export function describeSend(intro: string, params: DraftEmailParams): RenderedD
   builder.inline("Subject", params.subject);
   if (params.inReplyTo?.length) builder.list("In-Reply-To", params.inReplyTo.map(id => `<${id}>`));
   if (params.references?.length) builder.list("References", params.references.map(id => `<${id}>`));
+  if (params.attachments?.length) {
+    builder.list("Attachments", params.attachments.map(attachment => attachment.kind === "new"
+      ? `${attachment.filename} · ${attachment.mimeType} · ${formatBytes(attachment.size)} · SHA-256 ${attachment.sha256}`
+      : `${attachment.filename} · ${attachment.mimeType} · ${formatBytes(attachment.size)} · from the message ${attachment.source}`));
+  }
   if (params.textBody !== undefined) builder.verbatim("Plain text", params.textBody);
   if (params.htmlBody !== undefined) {
     builder.verbatim("HTML", params.htmlBody, "html");
@@ -39,6 +44,12 @@ export function describeSend(intro: string, params: DraftEmailParams): RenderedD
     builder.verbatim("HTML", textToHtml(params.textBody), "html");
   }
   return builder.finish();
+}
+
+function formatBytes(size: number): string {
+  if (size < 1024) return `${size} bytes`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KiB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MiB`;
 }
 
 /** One message a thread change applies to, as the approver recognizes it. */

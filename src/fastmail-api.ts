@@ -393,6 +393,33 @@ export async function downloadBlob(
   return res.arrayBuffer();
 }
 
+/**
+ * Uploads content to the account's blob store (RFC 8620 §6.1). Unreferenced blobs may be deleted
+ * after an hour, so this runs only when an approved draft or send is about to reference it.
+ */
+export async function uploadBlob(
+  uploadUrlTemplate: string, apiToken: string, accountId: string, content: Uint8Array, mimeType: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ blobId: string; size: number }> {
+  const url = uploadUrlTemplate.replace("{accountId}", encodeURIComponent(accountId));
+  const res = await fetchImpl(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": mimeType },
+    body: content,
+  });
+  if (!res.ok) throw errorForStatus(res.status);
+  let uploaded: { blobId?: unknown; size?: unknown };
+  try {
+    uploaded = JSON.parse(await readTextCapped(res)) as typeof uploaded;
+  } catch (error) {
+    throw new FastmailError("UPSTREAM_UNAVAILABLE", "Fastmail's upload response could not be parsed.", { cause: error });
+  }
+  if (typeof uploaded.blobId !== "string" || typeof uploaded.size !== "number") {
+    throw new FastmailError("UPSTREAM_UNAVAILABLE", "Fastmail did not report the uploaded blob.");
+  }
+  return { blobId: uploaded.blobId, size: uploaded.size };
+}
+
 // ---------------------------------------------------------------------------
 // Mutations
 
@@ -427,7 +454,20 @@ export type SendEmailParams = {
   /** Threading headers for a reply (message ids without angle brackets). */
   inReplyTo?: string[];
   references?: string[];
+  /** Attachments, as recorded before approval (see `./attachments.ts`). */
+  attachments?: AttachmentRef[];
 };
+
+/** An attachment of a pending draft or send. */
+export type AttachmentRef =
+  /** New content, stored in the binding by SHA-256 until it is uploaded on approval. */
+  | { kind: "new"; filename: string; mimeType: string; size: number; sha256: string }
+  /** An attachment already in the account: a blob of message `fromEmailId`. `source` names that
+   * message for the approver. */
+  | { kind: "existing"; filename: string; mimeType: string; size: number; blobId: string; fromEmailId: string; source: string };
+
+/** An attachment as it goes on the Email, once uploaded. */
+export type UploadedBlob = { blobId: string; type: string; name: string };
 
 /** The account-specific ids a send needs, resolved at apply time by `resolveSendContext()`. */
 export type SendContext = {
@@ -492,7 +532,11 @@ export function textToHtml(text: string): string {
 
 /** The content of an Email to create in Drafts: the fields `sendEmail()` and `writeDraft()` share.
  * `from` is optional only for a draft, whose sender Fastmail fills in when it is opened. */
-export type DraftEmailParams = Omit<SendEmailParams, "from"> & { from?: string };
+export type DraftEmailParams = Omit<SendEmailParams, "from"> & {
+  from?: string;
+  /** The attachments' blobs, resolved at apply time by `uploadAttachments()`. */
+  attachmentBlobs?: UploadedBlob[];
+};
 
 /**
  * The `Email/set create` object for a message in Drafts. Falls back to a derived HTML alternative
@@ -527,6 +571,9 @@ function draftEmailCreate(
     bodyValues,
     textBody: textBody.length > 0 ? textBody : undefined,
     htmlBody: htmlBody.length > 0 ? htmlBody : undefined,
+    attachments: params.attachmentBlobs?.length
+      ? params.attachmentBlobs.map(blob => ({ blobId: blob.blobId, type: blob.type, name: blob.name, disposition: "attachment" }))
+      : undefined,
   };
 }
 
@@ -536,7 +583,8 @@ function draftEmailCreate(
  * `$draft` once the submission succeeds — the sequence Fastmail's own docs describe for sending mail.
  */
 export async function sendEmail(
-  apiUrl: string, apiToken: string, accountId: string, params: SendEmailParams, context: SendContext,
+  apiUrl: string, apiToken: string, accountId: string,
+  params: SendEmailParams & { attachmentBlobs?: UploadedBlob[] }, context: SendContext,
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ emailId: string }> {
   const draftId = "draft1";

@@ -12,6 +12,7 @@ import {
   type DraftContent,
   type DraftRecord,
 } from "./cache";
+import { attachmentSummaries, uploadAttachments } from "./attachments";
 import { FastmailError } from "./errors";
 import {
   destroyEmails,
@@ -28,6 +29,8 @@ import type { FastmailAddress, FastmailDraftInfo } from "./types";
 /** What applying a revision needs from the stored grant. */
 export type DraftGrant = Pick<FastmailAccountInfo, "apiUrl" | "accountId" | "hasSubmission"> & {
   apiToken: string;
+  /** Needed only to upload a revision's new attachments. */
+  uploadUrlTemplate?: string;
 };
 
 /** The draft's current content, or `RESOURCE_NOT_FOUND` if it was deleted, sent, or never existed. */
@@ -56,6 +59,7 @@ export function toDraftInfo(record: DraftRecord, content: DraftContent, at: numb
     bcc: toAgentAddresses(content.bcc),
     subject: content.subject,
     isReply: record.answersEmailId !== undefined,
+    attachments: attachmentSummaries(content.attachments),
     updatedAt: new Date(at),
   };
 }
@@ -91,8 +95,10 @@ export async function applyDraftRevision(
   let emailId: string | undefined;
   if (revision.kind === "content") {
     const draftsMailboxId = await findDraftsMailboxId(apiUrl, apiToken, accountId, hasSubmission, fetchImpl);
+    const attachmentBlobs = await uploadAttachments(
+      kv, { ...grant, uploadUrlTemplate: grant.uploadUrlTemplate ?? "" }, revision.content.attachments, fetchImpl);
     ({ emailId } = await writeDraft(
-      apiUrl, apiToken, accountId, hasSubmission, { from: record.from, ...revision.content },
+      apiUrl, apiToken, accountId, hasSubmission, { from: record.from, ...revision.content, attachmentBlobs },
       draftsMailboxId, previousEmailId, fetchImpl));
   } else if (revision.kind === "deleted") {
     if (previousEmailId) {
@@ -101,7 +107,9 @@ export async function applyDraftRevision(
   } else {
     if (!revision.params) throw new Error(`Fastmail draft ${draftId} has no snapshot to send.`);
     const context = await resolveSendContext(apiUrl, apiToken, accountId, revision.params.from, fetchImpl);
-    await sendEmail(apiUrl, apiToken, accountId, revision.params, context, fetchImpl);
+    const attachmentBlobs = await uploadAttachments(
+      kv, { ...grant, uploadUrlTemplate: grant.uploadUrlTemplate ?? "" }, revision.params.attachments, fetchImpl);
+    await sendEmail(apiUrl, apiToken, accountId, { ...revision.params, attachmentBlobs }, context, fetchImpl);
   }
 
   // Re-read: revisions may have been submitted while Fastmail was being called.

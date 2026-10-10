@@ -79,6 +79,19 @@ export type FastmailMessage = {
   keywords: string[];
 };
 
+/**
+ * An attachment for a draft, send or reply: new content, or one of the attachments of a message this
+ * connection can open (by that message's id and the attachment's `blobId` from
+ * `FastmailMessage.attachments`), which is attached without downloading it. At most 20 attachments
+ * and 10 MiB in total per message.
+ */
+export type FastmailOutgoingAttachment =
+  | { filename: string; mimeType: string; content: ArrayBuffer }
+  | { fromMessageId: string; blobId: string; filename?: string };
+
+/** An attachment on a draft. */
+export type FastmailDraftAttachment = { filename: string; mimeType: string; size: number };
+
 /** Recipients, subject and body of a new draft. Every field may be left out and filled in later
  * with `FastmailDraft.update()`. Passing only `text` (no `html`) still produces a normally-formatted
  * message: a simple HTML version is derived from it automatically. */
@@ -89,6 +102,7 @@ export type FastmailDraftInput = {
   subject?: string;
   text?: string;
   html?: string;
+  attachments?: FastmailOutgoingAttachment[];
 };
 
 /** Fields to replace on a draft. Omitted fields stay as they are; `html: null` removes an explicit
@@ -100,6 +114,8 @@ export type FastmailDraftPatch = {
   subject?: string;
   text?: string;
   html?: string | null;
+  /** Replaces the draft's attachments; `null` or `[]` removes them all. */
+  attachments?: FastmailOutgoingAttachment[] | null;
 };
 
 /** A draft's current addressees and subject. */
@@ -112,6 +128,7 @@ export type FastmailDraftInfo = {
   subject: string;
   /** True for a draft created with `createReplyDraft()`: it stays in the original's thread. */
   isReply: boolean;
+  attachments: FastmailDraftAttachment[];
   /** When the draft was created or last edited. */
   updatedAt: Date;
 };
@@ -337,7 +354,7 @@ export interface FastmailSession extends FastmailDraftOnlySession {
     to: FastmailAddress[],
     subject: string,
     body: { text?: string; html?: string },
-    options?: { cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<void>;
 }
 
@@ -352,7 +369,7 @@ export interface FastmailDraftOnlyThread {
    */
   createReplyDraft(
     body: { text?: string; html?: string },
-    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<FastmailDraft>;
 
   /** Downloads one attachment's content, by the `blobId` from `FastmailMessage.attachments`. */
@@ -409,7 +426,7 @@ export interface FastmailThread extends FastmailDraftOnlyThread {
    */
   reply(
     body: { text?: string; html?: string },
-    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<void>;
 
   /**
@@ -418,7 +435,7 @@ export interface FastmailThread extends FastmailDraftOnlyThread {
    */
   createReplyDraft(
     body: { text?: string; html?: string },
-    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<FastmailSendableDraft>;
 }
 
@@ -453,7 +470,7 @@ export interface FastmailDraftOnlyMessageRef {
    */
   createReplyDraft(
     body: { text?: string; html?: string },
-    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<FastmailDraft>;
 }
 
@@ -467,12 +484,12 @@ export interface FastmailMessageRef extends FastmailDraftOnlyMessageRef {
    */
   reply(
     body: { text?: string; html?: string },
-    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<void>;
   /** As `FastmailDraftOnlyMessageRef.createReplyDraft()`, with a draft that can also be sent. */
   createReplyDraft(
     body: { text?: string; html?: string },
-    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[]; attachments?: FastmailOutgoingAttachment[] },
   ): Promise<FastmailSendableDraft>;
 }
 
