@@ -697,6 +697,8 @@ function toAgentMessage(email: JmapEmailObject, keywordOverlay: Record<string, b
     mimeType: attachment.type,
     size: attachment.size,
     blobId: attachment.blobId,
+    inline: attachment.disposition === "inline",
+    ...attachment.cid ? { cid: attachment.cid.replace(/^<|>$/g, "") } : {},
   }));
   return {
     id: email.id,
@@ -1099,7 +1101,8 @@ function forwardContent(
   const subject = original.subject ?? "";
   const headers: [string, string][] = [
     ["From", formatAddresses(original.from)],
-    ["Date", new Date(original.receivedAt).toUTCString()],
+    // The original's own Date header; when it was received only if it has none.
+    ["Date", new Date(original.sentAt ?? original.receivedAt).toUTCString()],
     ["Subject", subject],
     ["To", formatAddresses(original.to)],
   ];

@@ -312,7 +312,7 @@ export async function getThreadMetadata(
 }
 
 const MESSAGE_PROPERTIES = [
-  "id", "threadId", "mailboxIds", "keywords", "from", "to", "cc", "subject", "receivedAt", "preview",
+  "id", "threadId", "mailboxIds", "keywords", "from", "to", "cc", "subject", "receivedAt", "sentAt", "preview",
   "textBody", "htmlBody", "bodyValues", "attachments",
 ];
 

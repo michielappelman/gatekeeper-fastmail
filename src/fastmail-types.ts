@@ -60,6 +60,8 @@ export type JmapEmailObject = {
   cc: JmapEmailAddress[] | null;
   subject: string | null;
   receivedAt: string;
+  /** The `Date` header: when the sender says it was sent; only when requested. */
+  sentAt?: string | null;
   preview: string;
   textBody?: { partId: string | null; type?: string }[];
   htmlBody?: { partId: string | null; type?: string }[];

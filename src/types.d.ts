@@ -51,6 +51,11 @@ export type FastmailAttachment = {
   mimeType: string;
   size: number;
   blobId: string;
+  /** True for a part the HTML body shows in place (e.g. a logo), rather than a file attached to
+   * the message. */
+  inline: boolean;
+  /** The Content-ID the HTML body refers to it by (`<img src="cid:...">`), if any. */
+  cid?: string;
 };
 
 /** Result of converting an attachment's content to Markdown. */

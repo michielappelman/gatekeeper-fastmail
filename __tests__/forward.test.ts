@@ -12,7 +12,7 @@ const GRANT = {
 const HTML_ORIGINAL = {
   id: "e1", threadId: "t1", mailboxIds: { inbox: true }, keywords: {}, messageId: ["m1@x"],
   from: [{ email: "billing@example.com", name: "Billing" }], to: [{ email: "me@fastmail.com" }], cc: [],
-  subject: "Invoice 42", receivedAt: "2026-10-01T10:00:00Z", preview: "Your invoice",
+  subject: "Invoice 42", receivedAt: "2026-10-01T10:00:05Z", sentAt: "2026-10-01T10:00:00Z", preview: "Your invoice",
   textBody: [{ partId: "1", type: "text/plain" }], htmlBody: [{ partId: "2", type: "text/html" }],
   bodyValues: {
     "1": { value: "Your invoice is attached." },
@@ -107,6 +107,15 @@ describe("forward()", () => {
       "Date: Thu, 01 Oct 2026 10:00:00 GMT\nSubject: Fwd: Notes\nTo: me@fastmail.com\n\nPlain <notes> & more.");
     // No HTML of its own: the plain text is what gets sent, with the usual derived HTML.
     expect(params.htmlBody).toBeUndefined();
+  });
+
+  it("tells an inline image apart from an attachment when reading", async () => {
+    const { session } = setup({ e1: HTML_ORIGINAL });
+    const message = await (await session.getMessage("e1")).read();
+    expect(message.attachments).toEqual([
+      { filename: "invoice-42.pdf", mimeType: "application/pdf", size: 2048, blobId: "Gpdf", inline: false },
+      { filename: "logo.png", mimeType: "image/png", size: 512, blobId: "Glogo", inline: true, cid: "logo@x" },
+    ]);
   });
 
   it("needs a recipient", async () => {
