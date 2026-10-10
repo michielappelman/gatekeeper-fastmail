@@ -7,7 +7,12 @@ import type { Cursor } from "@gadgets/workshop-shared/gatekeeper";
 export type { Cursor };
 
 /** One of Fastmail's standard system folder roles (JMAP Mailbox `role`), when set. */
-export type FastmailFolderRole = "inbox" | "sent" | "drafts" | "trash" | "junk" | "archive";
+export type FastmailFolderRole =
+  | "inbox" | "sent" | "drafts" | "trash" | "junk" | "archive"
+  // Fastmail's other special folders: mail it will send later, and mail snoozed until a set time.
+  | "scheduled" | "snoozed"
+  // Other roles a JMAP server may assign (RFC 8457).
+  | "all" | "flagged" | "important" | "subscribed";
 
 /** One Fastmail folder (a JMAP Mailbox — closer to an IMAP folder than a Gmail label: an email can
  * still live in more than one Mailbox at once). */
@@ -15,7 +20,7 @@ export type FastmailFolder = {
   /** Pass this to `listThreads()`/`searchThreads()`'s `folderId`, or `moveToFolder()`. */
   id: string;
   name: string;
-  /** Set for Fastmail's built-in system folders (Inbox, Sent, Drafts, Trash, Junk, Archive); null
+  /** Set for Fastmail's built-in system folders (Inbox, Sent, Drafts, Trash, Junk, Archive, ...); null
    * for a folder you created yourself. Use this to find "the archive folder" or "the trash folder"
    * rather than matching on `name`, which is user-renamable. */
   role: FastmailFolderRole | null;
@@ -481,8 +486,8 @@ export interface FastmailMessageRef extends FastmailDraftOnlyMessageRef {
  */
 export interface FastmailScopedDraftOnlySession {
   /**
-   * Lists the folders this connection may use: its own folder, and Fastmail's system folders
-   * (Inbox, Archive, Trash, Junk, Sent, Drafts) to move mail into.
+   * Lists the folders this connection may use: its own folder, and the Inbox, Archive, Trash and
+   * Junk folders to move mail into. A parent folder outside that list shows as `parentId: null`.
    */
   listFolders(): Promise<FastmailFolder[]>;
   /** Lists threads in scope, newest first. `folderId` narrows a saved search to one folder. */

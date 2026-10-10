@@ -105,8 +105,9 @@ search bindings do:
 - a search scope's admission is decided by Fastmail itself: one `Email/query` for the stored filter
   AND the emails' `Message-ID` headers (RFC 8621 `header` condition). Mail without a Message-ID is
   never admitted;
-- a narrowed binding sees only its own folder and the system folders (`role` set) in
-  `listFolders()`, and may move mail only into those;
+- a narrowed binding sees only its own folder and the Inbox, Archive, Trash and Junk folders in
+  `listFolders()`, and may move mail only into those (not Sent, Drafts, Scheduled or Snoozed); a
+  parent folder outside that set shows as `parentId: null`;
 - a narrowed binding can't write new mail (`send()`, `createDraft()`), but can reply, or draft a
   reply, to messages in scope;
 - ids outside the scope are refused exactly like ids that don't exist.

@@ -124,10 +124,28 @@ describe("ScopeGuard", () => {
     ] });
   });
 
-  it("shows a narrowed binding only its own folder and the system folders", () => {
+  it("shows a narrowed binding only its own folder and the filing system folders", () => {
     const visible = new ScopeGuard({ kind: "folder", folderId: "receipts" }).visibleFolders(FOLDERS as any);
     expect(visible.map(folder => folder.id)).toEqual(["inbox", "archive", "receipts"]);
     expect(new ScopeGuard().visibleFolders(FOLDERS as any)).toHaveLength(4);
+  });
+
+  it("hides Sent, Drafts, Scheduled and Snoozed, and a hidden parent's id", () => {
+    const folders = [
+      { id: "inbox", name: "Inbox", parentId: null, role: "inbox" },
+      { id: "sent", name: "Sent", parentId: null, role: "sent" },
+      { id: "snoozed", name: "Snoozed", parentId: null, role: "snoozed" },
+      { id: "scheduled", name: "Scheduled", parentId: null, role: "scheduled" },
+      { id: "home", name: "Home", parentId: null, role: null },
+      { id: "funda", name: "Funda", parentId: "home", role: null },
+    ];
+    const visible = new ScopeGuard({ kind: "folder", folderId: "funda" }).visibleFolders(folders as any);
+    expect(visible).toEqual([
+      { id: "inbox", name: "Inbox", parentId: null, role: "inbox" },
+      { id: "funda", name: "Funda", parentId: null, role: null },
+    ]);
+    // The whole mailbox keeps the tree as it is.
+    expect(new ScopeGuard().visibleFolders(folders as any)[5].parentId).toBe("home");
   });
 });
 

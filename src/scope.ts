@@ -33,6 +33,12 @@ export function outOfScope(what: string): FastmailError {
   return new FastmailError("RESOURCE_NOT_FOUND", `${what} was not found in this Fastmail binding.`);
 }
 
+/**
+ * System folders a narrowed binding may see and move mail into. Not Sent, Drafts, Scheduled or
+ * Snoozed: filing mail there would fake a send, a draft, a scheduled send or a snooze.
+ */
+const SCOPED_FILING_ROLES: ReadonlySet<string> = new Set(["inbox", "archive", "trash", "junk"]);
+
 export class ScopeGuard {
   constructor(readonly scope: FastmailScope = MAILBOX_SCOPE) {}
 
@@ -96,13 +102,18 @@ export class ScopeGuard {
 
   /**
    * The folders this binding may name: every folder for the whole mailbox; otherwise its own folder
-   * and the system folders (Inbox, Archive, Trash, Junk, ...), so it can file mail away without
-   * learning the rest of the folder tree.
+   * and the system folders mail can sensibly be filed into (Inbox, Archive, Trash, Junk), so it can
+   * file mail away without learning the rest of the folder tree. A parent outside that set is
+   * hidden by clearing `parentId`, so not even its id shows.
    */
   visibleFolders(folders: JmapMailboxObject[]): JmapMailboxObject[] {
     if (this.scope.kind === "mailbox") return folders;
     const bound = this.boundFolderId;
-    return folders.filter(folder => folder.role || folder.id === bound);
+    const visible = folders.filter(folder =>
+      folder.id === bound || (folder.role !== null && SCOPED_FILING_ROLES.has(folder.role)));
+    const ids = new Set(visible.map(folder => folder.id));
+    return visible.map(folder =>
+      folder.parentId === null || ids.has(folder.parentId) ? folder : { ...folder, parentId: null });
   }
 
   /** Refuses sending or drafting new mail on a narrowed binding, which may only answer mail in scope. */
