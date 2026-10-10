@@ -94,7 +94,7 @@ just confirms what's being connected and reports the fixed resource URL, the sam
 ## Session API
 
 See `types.d.ts` for the full agent-facing surface: `FastmailSession.listFolders/listThreads/
-searchThreads/getThread/send/createDraft/listDrafts/getDraft`, `FastmailThread.messages/reply/
+searchThreads/getThread/send/createDraft/listDrafts/getDraft/subscribeNewMessages`, `FastmailThread.messages/reply/
 createReplyDraft/readAttachment/moveToFolder/addKeyword/removeKeyword/markRead/markUnread`, and
 `FastmailSendableDraft.getMetadata/getContent/update/delete/send`. Deliberately no Gmail-style
 `archive()`/`trash()` convenience verbs — call `listFolders()`, find the folder whose `role` is
@@ -150,6 +150,54 @@ provider, not only by the gatekeeper. Drafts on such a connection use the JMAP s
 as their From address when no sending identity is available. Grants stored before `username` was
 recorded leave From unset on such drafts until the account is reconnected.
 
+## New-mail hooks
+
+`subscribeNewMessages(hook, { folderId? })` binds a hook that is called with each new message
+arriving in the inbox, or in the folder named (e.g. one a Fastmail rule files mail into). It follows
+gatekeeper-google's `subscribeNewMessages()`: the hook is a persistent stub, the user approves it
+before anything is delivered, and each firing gets `{ message, folderId, thread }`, where `thread` is
+a full `FastmailThread` (or `FastmailDraftOnlyThread`) whose writes are queued for approval like
+any other. Drafts and mail received before the hook was enabled are never delivered; a message
+moved into the folder later is an update, not new mail. Delivery is at least once and unordered,
+retried with backoff (eight attempts), so hooks should key their work on `message.id`.
+
+`src/hooks.ts` holds the mechanism. One `FastmailHookDriver` Durable Object per connection (named
+by its `UserAccount` id, so one API token) keeps an `Email` state cursor and reads
+`Email/changes` + `Email/get` (by back-reference, one request) from it; every email created in a
+hook's folder since the hook was enabled is queued for that hook. Delivery goes through a
+persistent self-stub of the binding's facet (`FastmailHookDeliveryImpl`), which re-reads the
+message, re-checks the folder and draft state, authorizes the observation, and only then calls the
+hook. If Fastmail can no longer compute changes from the stored state (`cannotCalculateChanges`),
+the driver starts over from the current state and mail in that gap is not delivered.
+
+The driver learns of new mail in two ways:
+
+- **JMAP push** ([RFC 8620 §7.2](https://www.rfc-editor.org/rfc/rfc8620#section-7.2)). The driver
+  creates a `PushSubscription` for `types: ["EmailDelivery"]` (state changes only on new mail,
+  [RFC 8621 §1.5](https://www.rfc-editor.org/rfc/rfc8621#section-1.5)) pointing at
+  `{BASE_URL}/push/{userObjectId}/{secret}`, with Web Push keys it generates and keeps in its own
+  storage. Fastmail encrypts every push to those keys ([RFC 8291](https://www.rfc-editor.org/rfc/rfc8291),
+  `aes128gcm`), first a `PushVerification` that the driver echoes back with `PushSubscription/set`,
+  then a `StateChange` per delivery, which only makes the driver read changes now. A push that
+  isn't for the driver's current subscription or doesn't decrypt gets a 404. The subscription is
+  renewed a day before it expires, replaced when the connection's token changes (Fastmail destroys
+  a subscription with its credentials), and destroyed when the last hook is disabled. One
+  Fastmail hasn't verified within 10 minutes is dropped and retried hourly.
+- **Polling**. Every 2 minutes while there is no verified subscription (a local or non-HTTPS
+  `BASE_URL`, an unreachable push path, setup in progress), and every 15 minutes as a safety net
+  while push works, since a push can be delayed or dropped. Each poll is one JMAP request.
+
+### Receiving pushes behind Cloudflare Access
+
+Fastmail must be able to `POST` to `{BASE_URL}/push/...` without signing in. On a deployment behind
+Cloudflare Access, add a **Bypass** for that path (a self-hosted Access application for
+`<host>/gatekeeper/fastmail/push` with a Bypass policy for Everyone; the more specific path wins
+over the application protecting the host). Each subscription's URL carries a 256-bit secret, and a
+push is acted on only if it decrypts with that subscription's keys; even then it carries only state
+strings, so a forged one could at most make the driver read the mailbox with its own credentials.
+Without the bypass, hooks still work at the 2-minute polling interval, and the driver retries push
+hourly.
+
 ## Observers
 
 Strategy A (private-only, see `write-gatekeeper` skill "Observer verification"): a personal mailbox
@@ -159,6 +207,8 @@ has no per-observer ACL Fastmail exposes to check a second connected account aga
 ## Current scope
 
 - Resource scope is the whole mailbox; per-folder and per-search binding selection is not exposed.
+- New-mail hooks watch one folder each and report new mail only, not moves, flag changes or
+  deletions.
 - Drafts and sends carry no attachments.
 - Token rotation is handled by reconnecting with a new token; there is no refresh-token cycle.
 - Fastmail is not a sign-in identity provider (`getAuthenticatedEmail()` returns `null`), even though

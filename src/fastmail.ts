@@ -1,4 +1,4 @@
-import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:workers";
+import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint, restore } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
 import {
   stripTrailingSlashes,
@@ -77,6 +77,12 @@ import {
   type SendEmailParams,
 } from "./fastmail-api";
 import type { JmapEmailObject, JmapMailboxObject } from "./fastmail-types";
+import {
+  handlePush,
+  type FastmailHookDelivery,
+  type FastmailHookParams,
+  type FastmailMessageHookTarget,
+} from "./hooks";
 import { FASTMAIL_RESOURCE, parseResourceUrl, SUPPORTED_RESOURCES, toResourceUrl } from "./resource";
 import type {
   FastmailAddress,
@@ -228,6 +234,10 @@ export default {
         return htmlResponse(connectHandoffPageHtml(result.handoff));
       }
     }
+
+    // Fastmail's JMAP pushes for new-mail hooks: /push/<driver>/<secret> (see hooks.ts).
+    const push = await handlePush(relPath, req, ctx.exports);
+    if (push) return push;
 
     return new Response("Not Found", { status: 404 });
   },
@@ -626,7 +636,49 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<FastmailSession> {
     return new FastmailSessionImpl(
-      approvalQueue.dup(), this.#userAccount(), this.ctx.storage.kv, this.env.WORKERS_AI);
+      approvalQueue.dup(), this.#userAccount(), this.ctx.storage.kv, this.env.WORKERS_AI,
+      (queue, hook, folderId) => this.#subscribe(queue, hook, folderId));
+  }
+
+  [restore](params: FastmailHookParams): FastmailHookDelivery {
+    if (typeof params?.folderId !== "string" || !params.folderId) {
+      throw new TypeError("Invalid Fastmail hook params.");
+    }
+    return new FastmailHookDeliveryImpl(
+      params.folderId, this.#userAccount(), this.ctx.storage.kv, this.env.WORKERS_AI);
+  }
+
+  /** Bind a hook on new mail in `folderId`, or the inbox. Enabled only once the user approves. */
+  async #subscribe(
+    approvalQueue: RpcStub<ApprovalQueue>, hook: RpcStub<FastmailMessageHookTarget>, folderId: string | undefined,
+  ): Promise<void> {
+    const grant = await this.#userAccount().getGrant();
+    const folders = await listMailboxes(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission);
+    const folder = folderId === undefined
+      ? folders.find(mailbox => mailbox.role === "inbox")
+      : folders.find(mailbox => mailbox.id === folderId);
+    if (!folder) {
+      throw new FastmailError("RESOURCE_NOT_FOUND", folderId === undefined
+        ? "This Fastmail account has no inbox folder."
+        : `Fastmail folder ${folderId} was not found. Use an id from listFolders().`);
+    }
+    const params: FastmailHookParams = { folderId: folder.id };
+    using delivery: RpcStub<FastmailHookDelivery> = await this.ctx.restore(params);
+    const controller = this.ctx.exports.FastmailHookController({ props: {
+      ...params,
+      key: crypto.randomUUID(),
+      userObjectId: this.ctx.props.userObjectId,
+      delivery,
+    } });
+    // A folder name is the user's own text: keep it on one line and out of the Markdown.
+    const name = folder.name.replace(/[\r\n"`*_[\]<>]/g, " ").trim();
+    const where = folder.role === "inbox" ? "the Fastmail inbox" : `the Fastmail folder "${name}"`;
+    // @ts-expect-error Worker RPC's mapped types can't relate the controller's generic hook type.
+    await approvalQueue.bindHook(controller, hook, {
+      title: "Watch for new Fastmail messages",
+      description: `Call this hook with each new message received in ${where}, letting it read that ` +
+        "message and queue replies and changes for approval.",
+    });
   }
 
   /** Action ids whose `applyAction()` is awaiting Fastmail in this instance. The input gate is open
@@ -924,15 +976,17 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
   #account: DurableObjectStub<UserAccount>;
   #kv: DurableObjectStorage["kv"];
   #ai: Ai;
+  #subscribe: SubscribeNewMessages | undefined;
 
   constructor(
       approvalQueue: RpcStub<ApprovalQueue>, account: DurableObjectStub<UserAccount>,
-      kv: DurableObjectStorage["kv"], ai: Ai) {
+      kv: DurableObjectStorage["kv"], ai: Ai, subscribe?: SubscribeNewMessages) {
     super();
     this.#approvalQueue = approvalQueue;
     this.#account = account;
     this.#kv = kv;
     this.#ai = ai;
+    this.#subscribe = subscribe;
   }
 
   [Symbol.dispose]() {
@@ -1065,6 +1119,72 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
   async getDraft(id: string): Promise<FastmailSendableDraft> {
     currentDraft(this.#kv, id);
     return new FastmailDraftImpl(this.#approvalQueue.dup(), this.#account, this.#kv, id);
+  }
+
+  async subscribeNewMessages(
+    hook: RpcStub<FastmailMessageHookTarget>, options?: { folderId?: string },
+  ): Promise<void> {
+    if (!this.#subscribe) throw new Error("This Fastmail session can't watch for new mail.");
+    await this.#call(() => this.#subscribe!(this.#approvalQueue, hook, options?.folderId));
+  }
+}
+
+/** Binds a new-mail hook through the session's approval queue; see `FastmailGatekeeperImpl.#subscribe()`. */
+type SubscribeNewMessages = (
+  approvalQueue: RpcStub<ApprovalQueue>, hook: RpcStub<FastmailMessageHookTarget>, folderId: string | undefined,
+) => Promise<void>;
+
+// ---------------------------------------------------------------------------
+// Hook delivery
+
+/**
+ * What a hook's delivery stub restores to: one firing at a time, of an email only if it is (still)
+ * new mail in the hook's folder. The driver (hooks.ts) decides when to call it; this decides what
+ * the hook may see, as opening a session does.
+ */
+@validateRpc()
+export class FastmailHookDeliveryImpl extends RpcTarget implements FastmailHookDelivery {
+  constructor(
+    private readonly folderId: string,
+    private readonly account: DurableObjectStub<UserAccount>,
+    private readonly kv: DurableObjectStorage["kv"],
+    private readonly ai: Ai,
+  ) {
+    super();
+  }
+
+  async deliver(callback: RpcStub<FastmailMessageHookTarget>, approvalQueue: RpcStub<ApprovalQueue>,
+                emailId: string): Promise<void> {
+    if (!/^[A-Za-z0-9_-]{1,255}$/.test(emailId)) throw new TypeError("Invalid Fastmail email id.");
+    const grant = await this.account.getGrant();
+    let email: JmapEmailObject | undefined;
+    let messageIds: string[];
+    try {
+      [email] = await getMessages(
+        grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, [emailId]);
+      // Deleted since it arrived, filed elsewhere, or not mail at all.
+      if (!email || email.id !== emailId || !email.mailboxIds?.[this.folderId] || email.keywords?.["$draft"]) {
+        return;
+      }
+      ({ messageIds } = await getThreadMetadata(
+        grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, email.threadId));
+    } catch (error) {
+      if (error instanceof FastmailError && error.code === "AUTH_EXPIRED") {
+        await this.account.noteCredentialsExpired();
+      }
+      if (error instanceof FastmailError && error.code === "RESOURCE_NOT_FOUND") return;
+      throw error;
+    }
+
+    const message = toAgentMessage(email, getSimulatedKeywords(this.kv, email.id));
+    await approvalQueue.authorizeObservation({
+      title: `New Fastmail message: ${message.subject}`.slice(0, 200),
+      description: "Read a new message in the folder this hook watches: its sender, recipients, " +
+        "date, subject, keywords, body, and attachments' names.",
+    });
+    using thread = new FastmailThreadImpl(
+      approvalQueue.dup(), this.account, this.kv, messageIds, this.ai);
+    await callback.receiveMessage({ message, folderId: this.folderId, thread });
   }
 }
 

@@ -29,6 +29,12 @@
         "UserAccount",
         "FastmailGatekeeperImpl"
       ]
+    },
+    {
+      "tag": "v1",
+      "new_sqlite_classes": [
+        "FastmailHookDriver"
+      ]
     }
   ]
 }

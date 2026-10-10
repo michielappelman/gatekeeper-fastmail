@@ -581,3 +581,150 @@ export async function destroyEmails(
       methodErrorCode(failure), `Fastmail rejected deleting ${failedId}: ${failure.type}.`);
   }
 }
+
+// ---------------------------------------------------------------------------
+// New-mail hooks: Email state, changes, and push subscriptions (RFC 8620 §5.2, §7.2)
+
+/** The account's current `Email` state string, where `emailChanges()` starts reading from. */
+export async function getEmailState(
+  apiUrl: string, apiToken: string, accountId: string, fetchImpl: typeof fetch = fetch,
+): Promise<string> {
+  const result = await call(apiUrl, apiToken, [JMAP_CORE_CAPABILITY, JMAP_MAIL_CAPABILITY], "Email/get", {
+    accountId, ids: [], properties: ["id"],
+  }, fetchImpl);
+  if (typeof result.state !== "string") {
+    throw new FastmailError("UPSTREAM_UNAVAILABLE", "Fastmail did not report the mailbox state.");
+  }
+  return result.state;
+}
+
+/** What a hook needs to decide whether an email created since the cursor is new mail it watches. */
+export type CreatedEmail = Pick<JmapEmailObject, "id" | "mailboxIds" | "keywords" | "receivedAt">;
+
+export type EmailChangesPage =
+  | { kind: "ok"; created: CreatedEmail[]; newState: string; hasMoreChanges: boolean }
+  /** The server can no longer compute changes from that state (RFC 8620 §5.2): start over. */
+  | { kind: "reset" };
+
+/** The most changes one `emailChanges()` page asks for; `hasMoreChanges` continues it. */
+export const EMAIL_CHANGES_PAGE_SIZE = 256;
+
+/**
+ * One page of `Email/changes` since `sinceState`, with the emails it created fetched in the same
+ * request by back-reference. Updates and destroys are ignored: a hook only hears of new mail, and a
+ * move into a folder is an update. An email created and destroyed within the page is simply absent
+ * from the `Email/get` list.
+ */
+export async function emailChanges(
+  apiUrl: string, apiToken: string, accountId: string, sinceState: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<EmailChangesPage> {
+  const parsed = await request(apiUrl, apiToken, {
+    using: [JMAP_CORE_CAPABILITY, JMAP_MAIL_CAPABILITY],
+    methodCalls: [
+      ["Email/changes", { accountId, sinceState, maxChanges: EMAIL_CHANGES_PAGE_SIZE }, "c1"],
+      ["Email/get", {
+        accountId,
+        "#ids": { resultOf: "c1", name: "Email/changes", path: "/created" },
+        properties: ["id", "mailboxIds", "keywords", "receivedAt"],
+      }, "c2"],
+    ],
+  }, fetchImpl);
+  const [name, first] = parsed.methodResponses?.find(([, , id]) => id === "c1") ?? [];
+  if (name === "error" && (first as unknown as JmapMethodError).type === "cannotCalculateChanges") {
+    return { kind: "reset" };
+  }
+  const changes = methodResult(parsed, "c1", "Email/changes");
+  const got = methodResult(parsed, "c2", "Email/get");
+  if (typeof changes.newState !== "string") {
+    throw new FastmailError("UPSTREAM_UNAVAILABLE", "Fastmail did not report the new mailbox state.");
+  }
+  return {
+    kind: "ok",
+    created: (got.list as CreatedEmail[] | undefined) ?? [],
+    newState: changes.newState,
+    hasMoreChanges: changes.hasMoreChanges === true,
+  };
+}
+
+/** Web Push encryption keys for a push subscription (RFC 8291), base64url. */
+export type PushKeys = { p256dh: string; auth: string };
+
+/**
+ * Creates a push subscription for the token's credentials (RFC 8620 §7.2). Fastmail then POSTs a
+ * `PushVerification` to `url`, and pushes nothing else until `verifyPushSubscription()` echoes its
+ * code. `expires` is a request: the server may shorten it, so the returned value is what holds.
+ */
+export async function createPushSubscription(
+  apiUrl: string, apiToken: string,
+  subscription: { deviceClientId: string; url: string; keys: PushKeys; types: string[]; expires: Date },
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ id: string; expires: number | undefined }> {
+  const result = await call(apiUrl, apiToken, [JMAP_CORE_CAPABILITY], "PushSubscription/set", {
+    create: { push: { ...subscription, expires: utcDate(subscription.expires) } },
+  }, fetchImpl);
+  const notCreated = (result.notCreated as Record<string, JmapMethodError> | undefined)?.push;
+  if (notCreated) {
+    throw new FastmailError(
+      methodErrorCode(notCreated), `Fastmail refused the push subscription: ${describeMethodError(notCreated)}.`);
+  }
+  const created = (result.created as Record<string, { id?: string; expires?: string | null }> | undefined)?.push;
+  if (!created?.id) {
+    throw new FastmailError("UPSTREAM_UNAVAILABLE", "Fastmail did not report the new push subscription.");
+  }
+  return { id: created.id, expires: parseUtcDate(created.expires) };
+}
+
+/**
+ * Updates a push subscription: `verificationCode` to complete verification, `expires` to renew it.
+ * Returns the expiry the server set, if `expires` was asked for. Throws `RESOURCE_NOT_FOUND` when
+ * the subscription no longer exists, e.g. because its token was revoked (RFC 8620 §7.2).
+ */
+export async function updatePushSubscription(
+  apiUrl: string, apiToken: string, id: string, patch: { verificationCode?: string; expires?: Date },
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ expires: number | undefined }> {
+  const result = await call(apiUrl, apiToken, [JMAP_CORE_CAPABILITY], "PushSubscription/set", {
+    update: {
+      [id]: {
+        ...patch.verificationCode !== undefined ? { verificationCode: patch.verificationCode } : {},
+        ...patch.expires !== undefined ? { expires: utcDate(patch.expires) } : {},
+      },
+    },
+  }, fetchImpl);
+  const notUpdated = (result.notUpdated as Record<string, JmapMethodError> | undefined)?.[id];
+  if (notUpdated) {
+    throw new FastmailError(
+      methodErrorCode(notUpdated),
+      `Fastmail refused to update the push subscription: ${describeMethodError(notUpdated)}.`);
+  }
+  // A server returns only the properties it changed differently from the request (RFC 8620 §5.3).
+  const updated = (result.updated as Record<string, { expires?: string | null } | null> | undefined)?.[id];
+  return { expires: parseUtcDate(updated?.expires) ?? patch.expires?.getTime() };
+}
+
+/** Destroys a push subscription; one that is already gone counts as destroyed. */
+export async function destroyPushSubscription(
+  apiUrl: string, apiToken: string, id: string, fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const result = await call(apiUrl, apiToken, [JMAP_CORE_CAPABILITY], "PushSubscription/set", {
+    destroy: [id],
+  }, fetchImpl);
+  const failure = (result.notDestroyed as Record<string, JmapMethodError> | undefined)?.[id];
+  if (failure && failure.type !== "notFound") {
+    throw new FastmailError(
+      methodErrorCode(failure),
+      `Fastmail refused to remove the push subscription: ${describeMethodError(failure)}.`);
+  }
+}
+
+/** A JMAP `UTCDate`: RFC 3339 with a `Z` and no fractional seconds. */
+function utcDate(date: Date): string {
+  return date.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+function parseUtcDate(value: string | null | undefined): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const time = Date.parse(value);
+  return Number.isNaN(time) ? undefined : time;
+}

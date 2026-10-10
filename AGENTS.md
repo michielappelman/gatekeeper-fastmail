@@ -45,6 +45,9 @@ src/resource.ts       Whole-mailbox resource URL and validation
 src/cache.ts          Folder cache, pending actions, simulated keyword overlays, draft records
 src/drafts.ts         Draft revision ordering: what the agent sees, apply and reject
 src/errors.ts         Stable FastmailErrorCode mapping
+src/hooks.ts          New-mail hooks: controller, per-connection driver DO, push route
+src/hook-delivery-queue.ts  Per-hook retrying delivery queue (copied from gatekeeper-google)
+src/webpush.ts        Web Push (RFC 8291 aes128gcm) key generation and decryption
 src/configurator/     Zero-field whole-mailbox configurator source/types
 __tests__/             JMAP, resource, cache, and configurator tests
 ```
@@ -76,6 +79,13 @@ __tests__/             JMAP, resource, cache, and configurator tests
   archive/trash/etc.; do not add Gmail-style `archive()` or `trash()` shortcuts.
 - Mutations are not automatically reversible. Do not claim that sending, moving, or keyword edits
   can be reverted through the Gatekeeper.
+- New-mail hooks never store the gadget's callback: the overseer does, through `bindHook()`, and the
+  driver gets a fresh one from `HookInitiator.startHook()` per delivery. What a hook may see is
+  decided by `FastmailHookDeliveryImpl` in the facet, not by the driver's prefilter, and every
+  delivery authorizes its observation before calling the hook.
+- A push is acted on only if it reaches the driver's current subscription URL secret and decrypts
+  with that subscription's keys. The push private key and secret stay in the driver's storage; the
+  API token stays in `UserAccount`.
 
 ## JMAP protocol boundary
 
@@ -155,7 +165,9 @@ hand: change `cloudflare.config.ts` and run `pnpm configs:generate` from the sta
 Tests use mocked `fetch` and do not need Fastmail credentials. Coverage includes session discovery,
 capability checks, JMAP request/response mapping, resource validation, caching, simulated keywords,
 and configurator behavior. Full live-account and Durable Object `ctx.exports` integration coverage
-is not part of the current test suite.
+is not part of the current test suite. The hook driver's logic (`HookDriver`) is tested on fake
+storage with a test-side Web Push encryptor standing in for Fastmail (`__tests__/hooks.test.ts`),
+and `__tests__/hooks-worker.test.ts` reaches the real Durable Object.
 
 If the local package manager or workspace links are unavailable, report that explicitly rather than
 claiming tests passed. At minimum run `git diff --check` and inspect the final diff.

@@ -21,4 +21,6 @@ export const wrangler = {
 
 export const migrations: DurableObjectMigration[] = [
   { tag: "v0", new_sqlite_classes: ["UserAccount", "FastmailGatekeeperImpl"] },
+  // One per connection with new-mail hooks: their cursor, push subscription and delivery queue.
+  { tag: "v1", new_sqlite_classes: ["FastmailHookDriver"] },
 ];

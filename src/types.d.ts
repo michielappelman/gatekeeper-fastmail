@@ -1,3 +1,4 @@
+import type { RpcStub } from "cloudflare:workers";
 import type { Cursor } from "@gadgets/workshop-shared/gatekeeper";
 
 /** Forward-only paginated results. Call `next()` repeatedly on the same cursor to fetch successive
@@ -110,6 +111,27 @@ export type FastmailDraftInfo = {
   updatedAt: Date;
 };
 
+/** A new message, as delivered to a `FastmailMessageHook`. */
+export type FastmailNewMessage<Thread = FastmailThread> = {
+  /** The message, with its bodies and attachments' metadata. */
+  message: FastmailMessage;
+  /** The folder the hook watches, which the message arrived in. */
+  folderId: string;
+  /** The message's thread: reply, draft a reply, or organize it. Writes are queued for approval,
+   * and it is released when `receiveMessage()` returns. */
+  thread: Thread;
+};
+
+/** Implemented by a gadget to receive new mail; see `FastmailDraftOnlySession.subscribeNewMessages()`. */
+export interface FastmailMessageHook<Thread = FastmailThread> {
+  /**
+   * Called with each new message. Delivery is at least once and unordered, and a message this
+   * throws for is retried with backoff, eight attempts in all, so key any work on
+   * `entry.message.id` to keep it idempotent. Disabling the hook ends its retries.
+   */
+  receiveMessage(entry: FastmailNewMessage<Thread>): Promise<void>;
+}
+
 /**
  * A draft in the connected account's Drafts folder, created through this connection. The user can
  * open, edit and send it from Fastmail; edits made there are not reflected here.
@@ -189,6 +211,47 @@ export interface FastmailDraftOnlySession {
 
   /** Reopens a draft by its `FastmailDraftInfo.id`. */
   getDraft(id: string): Promise<FastmailDraft>;
+  /**
+   * Have `hook.receiveMessage()` called with each new message that arrives in a folder: the inbox
+   * unless `options.folderId` names another (a `FastmailFolder.id`, e.g. one your Fastmail rules
+   * file mail into). Drafts and mail that arrived before the hook was enabled are never delivered;
+   * a message moved into the folder later is not new mail. The hook starts disabled, and nothing is
+   * delivered until the user enables it. Every call creates a distinct hook, so subscribe once per
+   * folder to watch.
+   *
+   * New mail is usually delivered within seconds, through Fastmail's JMAP push; on a deployment
+   * Fastmail can't reach, or while push is being set up, it is checked for every two minutes.
+   *
+   * `hook` must be a persistent stub: from `executeCode`, create it with
+   * `env.MY_GADGET[restore](params)` on the Gadget's binding; inside the Gadget, with
+   * `this.ctx.restore(params)`. The Gadget's `[restore]()` receives those `params` for every
+   * delivery, so they can tell its subscriptions apart. The restored target is a separate
+   * object; pass it what it needs from `[restore]()`, such as `this`, the Gadget.
+   *
+   * @example
+   * // server.js
+   * import { DurableObject, RpcTarget, restore } from "cloudflare:workers";
+   * export class Gadget extends DurableObject {
+   *   async [restore](params) {
+   *     if (params.type === "fastmail") return new Triage();
+   *     throw new TypeError(`Unknown restore type: ${params.type}`);
+   *   }
+   * }
+   * class Triage extends RpcTarget {
+   *   async receiveMessage({ message, thread }) {
+   *     if (/urgent/i.test(message.subject)) await thread.addKeyword("$flagged");
+   *   }
+   * }
+   *
+   * // executeCode
+   * import { restore } from "cloudflare:workers";
+   * export default async function(self, env) {
+   *   await env.FASTMAIL.subscribeNewMessages(await env.MY_GADGET[restore]({ type: "fastmail" }));
+   * }
+   */
+  subscribeNewMessages(
+    hook: RpcStub<FastmailMessageHook<FastmailDraftOnlyThread>>, options?: { folderId?: string },
+  ): Promise<void>;
 }
 
 /**
@@ -204,6 +267,10 @@ export interface FastmailSession extends FastmailDraftOnlySession {
 
   /** Reopens a draft by its `FastmailDraftInfo.id`. */
   getDraft(id: string): Promise<FastmailSendableDraft>;
+  /** As `FastmailDraftOnlySession.subscribeNewMessages()`, with a thread that can also reply. */
+  subscribeNewMessages(
+    hook: RpcStub<FastmailMessageHook<FastmailThread>>, options?: { folderId?: string },
+  ): Promise<void>;
 
   /**
    * Queues a new message to send. Like any other action here, sending may be held for approval
