@@ -191,21 +191,41 @@ export type RawThreadEntry = {
   keywords: Record<string, boolean>;
 };
 
+/** A JMAP `Email/query` filter: a `FilterCondition` or a `FilterOperator` (RFC 8621 §4.4.1). */
+export type JmapFilter = Record<string, unknown>;
+
 /**
  * Fetches one page of thread entries (one email per thread, per JMAP's `collapseThreads`), for
- * `OffsetCursor.fetchPage(offset, limit)`. `filter` narrows by mailbox and/or full-text search.
+ * `OffsetCursor.fetchPage(offset, limit)`. `filter` narrows by mailbox, search, or a binding's scope.
  */
 export async function queryThreadPage(
   apiUrl: string, apiToken: string, accountId: string, hasSubmission: boolean,
-  filter: { inMailbox?: string; text?: string } | undefined, offset: number, limit: number,
+  filter: JmapFilter | undefined, offset: number, limit: number,
   fetchImpl: typeof fetch = fetch,
+): Promise<RawThreadEntry[]> {
+  return queryEmailPage(apiUrl, apiToken, accountId, hasSubmission, filter, offset, limit, true, fetchImpl);
+}
+
+/** As `queryThreadPage()`, but one entry per message rather than per thread. */
+export async function queryMessagePage(
+  apiUrl: string, apiToken: string, accountId: string, hasSubmission: boolean,
+  filter: JmapFilter | undefined, offset: number, limit: number,
+  fetchImpl: typeof fetch = fetch,
+): Promise<RawThreadEntry[]> {
+  return queryEmailPage(apiUrl, apiToken, accountId, hasSubmission, filter, offset, limit, false, fetchImpl);
+}
+
+async function queryEmailPage(
+  apiUrl: string, apiToken: string, accountId: string, hasSubmission: boolean,
+  filter: JmapFilter | undefined, offset: number, limit: number, collapseThreads: boolean,
+  fetchImpl: typeof fetch,
 ): Promise<RawThreadEntry[]> {
   const using = usingFor(hasSubmission);
   const queryResult = await call(apiUrl, apiToken, using, "Email/query", {
     accountId,
     filter: filter && Object.keys(filter).length > 0 ? filter : undefined,
     sort: [{ property: "receivedAt", isAscending: false }],
-    collapseThreads: true,
+    collapseThreads,
     position: offset,
     limit,
   }, fetchImpl);
@@ -221,6 +241,62 @@ export async function queryThreadPage(
   // Email/get does not promise to preserve the requested id order.
   const byOrder = new Map(ids.map((id, index) => [id, index]));
   return list.toSorted((a, b) => (byOrder.get(a.id) ?? 0) - (byOrder.get(b.id) ?? 0));
+}
+
+/** What a binding's scope needs to decide whether it admits an email. */
+export type AdmissionInfo = Pick<JmapEmailObject, "id" | "threadId" | "mailboxIds" | "keywords" | "messageId">;
+
+/** Fetches the admission-relevant properties of `emailIds`; ids that don't exist are left out. */
+export async function getAdmissionInfo(
+  apiUrl: string, apiToken: string, accountId: string, hasSubmission: boolean, emailIds: string[],
+  fetchImpl: typeof fetch = fetch,
+): Promise<AdmissionInfo[]> {
+  if (emailIds.length === 0) return [];
+  const result = await call(apiUrl, apiToken, usingFor(hasSubmission), "Email/get", {
+    accountId, ids: emailIds, properties: ["id", "threadId", "mailboxIds", "keywords", "messageId"],
+  }, fetchImpl);
+  return (result.list as AdmissionInfo[] | undefined) ?? [];
+}
+
+/**
+ * Of `emails`, the ids that match `condition`, decided by Fastmail itself: one `Email/query` for
+ * `condition` AND any of the emails' Message-IDs (RFC 8621's `header` filter), keeping only results
+ * that are among `emails`. An email with no Message-ID can't be checked, so it never matches.
+ */
+export async function filterEmailsMatching(
+  apiUrl: string, apiToken: string, accountId: string, hasSubmission: boolean,
+  condition: JmapFilter, emails: Pick<AdmissionInfo, "id" | "messageId">[],
+  fetchImpl: typeof fetch = fetch,
+): Promise<Set<string>> {
+  const candidates = new Set(emails.map(email => email.id));
+  const messageIds = [...new Set(emails.flatMap(email => email.messageId ?? []))];
+  if (messageIds.length === 0) return new Set();
+  const result = await call(apiUrl, apiToken, usingFor(hasSubmission), "Email/query", {
+    accountId,
+    filter: {
+      operator: "AND",
+      conditions: [
+        condition,
+        { operator: "OR", conditions: messageIds.map(id => ({ header: ["Message-ID", id] })) },
+      ],
+    },
+    // Copies of one message share its Message-ID, so a result may be outside `emails`.
+    limit: Math.min(256, Math.max(50, candidates.size * 4)),
+  }, fetchImpl);
+  return new Set(((result.ids as string[] | undefined) ?? []).filter(id => candidates.has(id)));
+}
+
+/** Fetches one email's raw header fields, in message order. */
+export async function getEmailHeaders(
+  apiUrl: string, apiToken: string, accountId: string, hasSubmission: boolean, emailId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ name: string; value: string }[]> {
+  const result = await call(apiUrl, apiToken, usingFor(hasSubmission), "Email/get", {
+    accountId, ids: [emailId], properties: ["id", "headers"],
+  }, fetchImpl);
+  const email = (result.list as { id: string; headers?: { name: string; value: string }[] }[] | undefined)?.[0];
+  if (!email) throw new FastmailError("RESOURCE_NOT_FOUND", `Fastmail email ${emailId} was not found.`);
+  return email.headers ?? [];
 }
 
 /** Fetches one thread's message ids and subject via `Thread/get`. */

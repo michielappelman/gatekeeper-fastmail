@@ -61,6 +61,9 @@ import { assertMarkdownConvertible, convertToMarkdown } from "./markdown";
 import {
   downloadBlob,
   fetchAccountInfo,
+  getAdmissionInfo,
+  getEmailHeaders,
+  queryMessagePage,
   fetchIdentityEmail,
   getMessages,
   getReplySource,
@@ -76,14 +79,24 @@ import {
   type RawThreadEntry,
   type SendEmailParams,
 } from "./fastmail-api";
-import type { JmapEmailObject, JmapMailboxObject } from "./fastmail-types";
+import type { JmapAttachment, JmapEmailObject, JmapMailboxObject } from "./fastmail-types";
 import {
   handlePush,
   type FastmailHookDelivery,
   type FastmailHookParams,
   type FastmailMessageHookTarget,
 } from "./hooks";
-import { FASTMAIL_RESOURCE, parseResourceUrl, SUPPORTED_RESOURCES, toResourceUrl } from "./resource";
+import {
+  describeSearchFilter,
+  FASTMAIL_RESOURCE,
+  MAILBOX_SCOPE,
+  normalizeSearchFilter,
+  parseResourceUrl,
+  SUPPORTED_RESOURCES,
+  toResourceUrl,
+  type FastmailScope,
+} from "./resource";
+import { outOfScope, ScopeGuard } from "./scope";
 import type {
   FastmailAddress,
   FastmailAttachment,
@@ -93,13 +106,19 @@ import type {
   FastmailFolder,
   FastmailMarkdownContent,
   FastmailMessage,
+  FastmailMessageEntry,
+  FastmailMessageRef,
   FastmailSendableDraft,
   FastmailSession,
   FastmailThread,
   FastmailThreadEntry,
 } from "./types";
 import TYPES_CODE from "./types.txt";
-import type { FastmailAccountConfiguratorRpc } from "./configurator/fastmail-account-configurator-types";
+import type {
+  ConfiguratorOption,
+  FastmailAccountConfiguratorRpc,
+  FastmailAccountConfiguratorValues,
+} from "./configurator/fastmail-account-configurator-types";
 import FASTMAIL_ACCOUNT_CONFIGURATOR_HTML from "./generated/fastmail-account-configurator-ui.txt";
 
 type Env = Cloudflare.Env & {
@@ -125,6 +144,11 @@ const FASTMAIL_LOGO_URL = `data:image/svg+xml;utf8,${encodeURIComponent(FASTMAIL
 function errorMessage(error: unknown): string {
   if (error instanceof FastmailError) return error.message;
   return error instanceof Error ? error.message : String(error);
+}
+
+/** User-controlled text (a folder name, a search term) kept to one line and out of the Markdown. */
+function plainInline(text: string): string {
+  return text.replace(/[\r\n"`*_[\]<>]/g, " ").trim();
 }
 
 /** One structured line per failure, greppable in `wrangler tail` output by `"tag":"fastmail"`. */
@@ -466,8 +490,8 @@ export class FastmailGatekeeperUserImpl extends WorkerEntrypoint<Env, FastmailGa
     class: DurableObjectClass<Gatekeeper<any>>;
     resource: SupportedResource;
   }> {
-    parseResourceUrl(url);
-    const props: FastmailGatekeeperImplProps = { userObjectId: this.ctx.props.userObjectId };
+    const scope = parseResourceUrl(url);
+    const props: FastmailGatekeeperImplProps = { userObjectId: this.ctx.props.userObjectId, scope };
     return { class: this.ctx.exports.FastmailGatekeeperImpl({ props }), resource: FASTMAIL_RESOURCE };
   }
 
@@ -484,7 +508,7 @@ export class FastmailGatekeeperUserImpl extends WorkerEntrypoint<Env, FastmailGa
     }
     return {
       iframeHtml: FASTMAIL_ACCOUNT_CONFIGURATOR_HTML,
-      ui: new RpcStub(new FastmailAccountConfiguratorUI()),
+      ui: new RpcStub(new FastmailAccountConfiguratorUI(this.#userAccount())),
     };
   }
 
@@ -531,9 +555,75 @@ export class FastmailVerifier extends WorkerEntrypoint<Env> implements Gatekeepe
 
 @validateRpc()
 export class FastmailAccountConfiguratorUI extends RpcTarget implements FastmailAccountConfiguratorRpc {
-  async resourceUrl(): Promise<string> {
-    return toResourceUrl();
+  constructor(private readonly account?: DurableObjectStub<UserAccount>) {
+    super();
   }
+
+  async resourceUrl(values?: FastmailAccountConfiguratorValues): Promise<string> {
+    return toResourceUrl(scopeFromConfiguratorValues(values ?? {}));
+  }
+
+  async listFolders(query: string): Promise<ConfiguratorOption[]> {
+    if (!this.account) return [];
+    const grant = await this.account.getGrant();
+    const folders = await listMailboxes(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission);
+    const byId = new Map(folders.map(folder => [folder.id, folder]));
+    const path = (folder: JmapMailboxObject): string => {
+      const names = [folder.name];
+      for (let parent = folder.parentId && byId.get(folder.parentId), depth = 0; parent && depth < 20;
+           parent = parent.parentId ? byId.get(parent.parentId) : undefined, depth++) {
+        names.unshift(parent.name);
+      }
+      return names.join(" / ");
+    };
+    const needle = query.trim().toLowerCase();
+    return folders
+      .map(folder => ({ folder, path: path(folder) }))
+      .filter(({ path }) => !needle || path.toLowerCase().includes(needle))
+      .toSorted((a, b) => a.path.localeCompare(b.path))
+      .slice(0, 50)
+      .map(({ folder, path }) => ({
+        value: folder.id,
+        title: path,
+        subtitle: folder.role ? `System folder (${folder.role})` : undefined,
+        meta: `${folder.totalEmails} message(s)`,
+      }));
+  }
+
+  async valuesFromResourceUrl(resourceUrl: string): Promise<FastmailAccountConfiguratorValues> {
+    const scope = parseResourceUrl(resourceUrl);
+    if (scope.kind === "folder") return { mode: "folder", folderId: scope.folderId };
+    if (scope.kind === "search") {
+      const { from, to, subject, text, folderId } = scope.filter;
+      return {
+        mode: "search", from: from ?? null, to: to ?? null, subject: subject ?? null, text: text ?? null,
+        searchFolderId: folderId ?? null,
+      };
+    }
+    return { mode: "all" };
+  }
+}
+
+/** The scope the configurator's values choose; throws `INVALID_RESOURCE` for an incomplete form. */
+export function scopeFromConfiguratorValues(values: FastmailAccountConfiguratorValues): FastmailScope {
+  const mode = values.mode ?? "all";
+  if (mode === "folder") {
+    if (!values.folderId) throw new FastmailError("INVALID_RESOURCE", "Choose a folder.");
+    return { kind: "folder", folderId: values.folderId };
+  }
+  if (mode === "search") {
+    return {
+      kind: "search",
+      filter: normalizeSearchFilter({
+        from: values.from ?? undefined,
+        to: values.to ?? undefined,
+        subject: values.subject ?? undefined,
+        text: values.text ?? undefined,
+        folderId: values.searchFolderId ?? undefined,
+      }),
+    };
+  }
+  return MAILBOX_SCOPE;
 }
 
 // ---------------------------------------------------------------------------
@@ -541,6 +631,8 @@ export class FastmailAccountConfiguratorUI extends RpcTarget implements Fastmail
 
 type FastmailGatekeeperImplProps = {
   userObjectId: string;
+  /** What this binding may see; absent on facets bound before scopes existed, which are whole-mailbox. */
+  scope?: FastmailScope;
 };
 
 function toAgentFolder(mailbox: JmapMailboxObject): FastmailFolder {
@@ -569,6 +661,23 @@ function toThreadEntry(raw: RawThreadEntry, keywordOverlay: Record<string, boole
     lastMessageAt: new Date(raw.receivedAt),
     unread: !keywords["$seen"],
     snippet: raw.preview,
+  };
+}
+
+function toMessageEntry(
+  raw: RawThreadEntry, keywordOverlay: Record<string, boolean> | undefined, ref: FastmailMessageRef,
+): FastmailMessageEntry {
+  const keywords = mergeSimulatedKeywords(raw.keywords, keywordOverlay);
+  return {
+    id: raw.id,
+    threadId: raw.threadId,
+    subject: raw.subject ?? "(no subject)",
+    from: formatAddresses(raw.from),
+    receivedAt: new Date(raw.receivedAt),
+    unread: !keywords["$seen"],
+    snippet: raw.preview,
+    keywords: Object.keys(keywords).filter(keyword => keywords[keyword]),
+    ref,
   };
 }
 
@@ -614,20 +723,49 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
     // never offered a method that can only fail. The runtime still refuses (`requireSender()`), and
     // Fastmail itself refuses EmailSubmission for such a token.
     const draftOnly = identity?.canSend === false;
-    const verbs = draftOnly ? "Read, organize, and draft" : "Read, organize, and send";
+    const scope = this.#scope;
+    const account = identity?.email ? `${identity.email} on Fastmail` : "this Fastmail account";
+    if (scope.kind === "mailbox") {
+      const verbs = draftOnly ? "Read, organize, and draft" : "Read, organize, and send";
+      return {
+        url: toResourceUrl(),
+        title: identity?.email ?? "Fastmail Mailbox",
+        snippet: `${verbs} email through ${account}.`,
+        suggestedBindingName: "FASTMAIL",
+        tsType: draftOnly ? "FastmailDraftOnlySession" : "FastmailSession",
+      };
+    }
+    const verbs = draftOnly ? "Read, organize, and draft replies to" : "Read, organize, and reply to";
+    const where = scope.kind === "folder"
+      ? `the folder "${await this.#folderName(scope.folderId)}"`
+      : `mail matching: ${describeSearchFilter(
+        scope.filter, scope.filter.folderId ? await this.#folderName(scope.filter.folderId) : undefined)}`;
     return {
-      url: toResourceUrl(),
-      title: identity?.email ?? "Fastmail Mailbox",
-      snippet: identity?.email
-        ? `${verbs} email through ${identity.email} on Fastmail.`
-        : `${verbs} email through this Fastmail account.`,
+      url: toResourceUrl(scope),
+      title: `${identity?.email ?? "Fastmail"}: ${scope.kind === "folder" ? await this.#folderName(scope.folderId) : "saved search"}`,
+      snippet: `${verbs} email in ${where}, in ${account}. Nothing outside it is visible.`,
       suggestedBindingName: "FASTMAIL",
-      tsType: draftOnly ? "FastmailDraftOnlySession" : "FastmailSession",
+      tsType: draftOnly ? "FastmailScopedDraftOnlySession" : "FastmailScopedSession",
     };
   }
 
   async getTypeScriptTypes(): Promise<string> {
     return TYPES_CODE;
+  }
+
+  get #scope(): FastmailScope {
+    return this.ctx.props.scope ?? MAILBOX_SCOPE;
+  }
+
+  /** A folder's name for display, or its id when it can't be looked up. */
+  async #folderName(folderId: string): Promise<string> {
+    try {
+      const grant = await this.#userAccount().getGrant();
+      const folders = await listMailboxes(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission);
+      return folders.find(folder => folder.id === folderId)?.name ?? folderId;
+    } catch {
+      return folderId;
+    }
   }
 
   async getAutoApprovableActions(): Promise<ActionKind[]> {
@@ -637,30 +775,58 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
   async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<FastmailSession> {
     return new FastmailSessionImpl(
       approvalQueue.dup(), this.#userAccount(), this.ctx.storage.kv, this.env.WORKERS_AI,
-      (queue, hook, folderId) => this.#subscribe(queue, hook, folderId));
+      (queue, hook, folderId) => this.#subscribe(queue, hook, folderId), new ScopeGuard(this.#scope));
   }
 
   [restore](params: FastmailHookParams): FastmailHookDelivery {
-    if (typeof params?.folderId !== "string" || !params.folderId) {
+    const folderId = params?.folderId;
+    // Only a search binding's hook may watch without a folder: its search decides admission.
+    if (folderId !== undefined ? typeof folderId !== "string" || !folderId : this.#scope.kind !== "search") {
       throw new TypeError("Invalid Fastmail hook params.");
     }
     return new FastmailHookDeliveryImpl(
-      params.folderId, this.#userAccount(), this.ctx.storage.kv, this.env.WORKERS_AI);
+      folderId, this.#userAccount(), this.ctx.storage.kv, this.env.WORKERS_AI, new ScopeGuard(this.#scope));
   }
 
   /** Bind a hook on new mail in `folderId`, or the inbox. Enabled only once the user approves. */
   async #subscribe(
     approvalQueue: RpcStub<ApprovalQueue>, hook: RpcStub<FastmailMessageHookTarget>, folderId: string | undefined,
   ): Promise<void> {
+    const scope = this.#scope;
     const grant = await this.#userAccount().getGrant();
     const folders = await listMailboxes(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission);
-    const folder = folderId === undefined
+    if (scope.kind !== "mailbox" && folderId !== undefined && folderId !== new ScopeGuard(scope).boundFolderId) {
+      throw new FastmailError(
+        "INVALID_RESOURCE", "This Fastmail binding watches its own folder or search; leave out folderId.");
+    }
+    if (scope.kind === "search") {
+      const searchFolder = scope.filter.folderId;
+      const params: FastmailHookParams = searchFolder ? { folderId: searchFolder } : {};
+      using delivery: RpcStub<FastmailHookDelivery> = await this.ctx.restore(params);
+      const controller = this.ctx.exports.FastmailHookController({ props: {
+        ...params,
+        key: crypto.randomUUID(),
+        userObjectId: this.ctx.props.userObjectId,
+        delivery,
+      } });
+      const folderName = searchFolder ? folders.find(folder => folder.id === searchFolder)?.name : undefined;
+      // @ts-expect-error Worker RPC's mapped types can't relate the controller's generic hook type.
+      await approvalQueue.bindHook(controller, hook, {
+        title: "Watch for new Fastmail messages",
+        description: "Call this hook with each new message matching this binding's saved search (" +
+          `${plainInline(describeSearchFilter(scope.filter, folderName))}), letting it read that message ` +
+          "and queue replies and changes for approval.",
+      });
+      return;
+    }
+    const wanted = scope.kind === "folder" ? scope.folderId : folderId;
+    const folder = wanted === undefined
       ? folders.find(mailbox => mailbox.role === "inbox")
-      : folders.find(mailbox => mailbox.id === folderId);
+      : folders.find(mailbox => mailbox.id === wanted);
     if (!folder) {
-      throw new FastmailError("RESOURCE_NOT_FOUND", folderId === undefined
+      throw new FastmailError("RESOURCE_NOT_FOUND", wanted === undefined
         ? "This Fastmail account has no inbox folder."
-        : `Fastmail folder ${folderId} was not found. Use an id from listFolders().`);
+        : `Fastmail folder ${wanted} was not found. Use an id from listFolders().`);
     }
     const params: FastmailHookParams = { folderId: folder.id };
     using delivery: RpcStub<FastmailHookDelivery> = await this.ctx.restore(params);
@@ -670,8 +836,7 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
       userObjectId: this.ctx.props.userObjectId,
       delivery,
     } });
-    // A folder name is the user's own text: keep it on one line and out of the Markdown.
-    const name = folder.name.replace(/[\r\n"`*_[\]<>]/g, " ").trim();
+    const name = plainInline(folder.name);
     const where = folder.role === "inbox" ? "the Fastmail inbox" : `the Fastmail folder "${name}"`;
     // @ts-expect-error Worker RPC's mapped types can't relate the controller's generic hook type.
     await approvalQueue.bindHook(controller, hook, {
@@ -977,16 +1142,23 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
   #kv: DurableObjectStorage["kv"];
   #ai: Ai;
   #subscribe: SubscribeNewMessages | undefined;
+  #guard: ScopeGuard;
 
   constructor(
       approvalQueue: RpcStub<ApprovalQueue>, account: DurableObjectStub<UserAccount>,
-      kv: DurableObjectStorage["kv"], ai: Ai, subscribe?: SubscribeNewMessages) {
+      kv: DurableObjectStorage["kv"], ai: Ai, subscribe?: SubscribeNewMessages,
+      guard: ScopeGuard = new ScopeGuard()) {
     super();
     this.#approvalQueue = approvalQueue;
     this.#account = account;
     this.#kv = kv;
     this.#ai = ai;
     this.#subscribe = subscribe;
+    this.#guard = guard;
+  }
+
+  get #ctx(): CapabilityContext {
+    return { approvalQueue: this.#approvalQueue, account: this.#account, kv: this.#kv, ai: this.#ai, guard: this.#guard };
   }
 
   [Symbol.dispose]() {
@@ -1016,7 +1188,7 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
         title: "List Fastmail folders",
         description: "List the folders in this Fastmail mailbox (cached).",
       });
-      return cached.map(toAgentFolder);
+      return this.#guard.visibleFolders(cached).map(toAgentFolder);
     }
 
     const grant = await this.#account.getGrant();
@@ -1027,10 +1199,12 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
       title: "List Fastmail folders",
       description: "List the folders in this Fastmail mailbox.",
     });
-    return folders.map(toAgentFolder);
+    return this.#guard.visibleFolders(folders).map(toAgentFolder);
   }
 
-  #threadCursor(filter: { inMailbox?: string; text?: string }): Cursor<FastmailThreadEntry> {
+  #threadCursor(caller: { inMailbox?: string; text?: string }): Cursor<FastmailThreadEntry> {
+    // Before dup(): a folder outside the binding throws without leaking a stub.
+    const filter = this.#guard.listFilter(caller);
     const approvalQueue = this.#approvalQueue.dup();
     const kv = this.#kv;
     const account = this.#account;
@@ -1063,16 +1237,57 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
 
   async getThread(threadId: string): Promise<FastmailThread> {
     const grant = await this.#account.getGrant();
-    const metadata = await this.#call(() =>
-      getThreadMetadata(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, threadId));
-    return new FastmailThreadImpl(
-      this.#approvalQueue.dup(), this.#account, this.#kv, metadata.messageIds, this.#ai);
+    return openThread(this.#ctx, grant, threadId);
+  }
+
+  #messageCursor(caller: { inMailbox?: string; text?: string }): Cursor<FastmailMessageEntry> {
+    // Before dup(): a folder outside the binding throws without leaking a stub.
+    const filter = this.#guard.listFilter(caller);
+    const ctx = { ...this.#ctx, approvalQueue: this.#approvalQueue.dup() };
+    const call = this.#call.bind(this);
+    return new OffsetCursor<FastmailMessageEntry>({
+      pageSize: 25,
+      dispose: () => ctx.approvalQueue[Symbol.dispose](),
+      fetchPage: async (offset, limit) => {
+        const grant = await ctx.account.getGrant();
+        const raw = await call(() => queryMessagePage(
+          grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, filter, offset, limit));
+        return raw.map(entry => toMessageEntry(
+          entry, getSimulatedKeywords(ctx.kv, entry.id),
+          new FastmailMessageRefImpl({ ...ctx, approvalQueue: ctx.approvalQueue.dup() }, entry.id)));
+      },
+      authorizePage: (items, { terminal }) => ctx.approvalQueue.authorizeObservation({
+        title: "List Fastmail messages",
+        description: terminal && items.length === 0
+          ? "Listed Fastmail messages; there were none matching."
+          : `Read ${items.length} Fastmail message summary(ies).`,
+      }),
+    });
+  }
+
+  async listMessages(folderId?: string): Promise<Cursor<FastmailMessageEntry>> {
+    return this.#messageCursor(folderId ? { inMailbox: folderId } : {});
+  }
+
+  async searchMessages(query: string, folderId?: string): Promise<Cursor<FastmailMessageEntry>> {
+    return this.#messageCursor(folderId ? { inMailbox: folderId, text: query } : { text: query });
+  }
+
+  async getMessage(id: string): Promise<FastmailMessageRef> {
+    if (!/^[A-Za-z0-9_-]{1,255}$/.test(id)) throw outOfScope("That message");
+    const grant = await this.#account.getGrant();
+    const infos = await this.#call(() =>
+      getAdmissionInfo(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, [id]));
+    const admitted = await this.#call(() => this.#guard.admitInfos(grant, infos));
+    if (!admitted.has(id)) throw outOfScope("That message");
+    return new FastmailMessageRefImpl({ ...this.#ctx, approvalQueue: this.#approvalQueue.dup() }, id);
   }
 
   async send(
     to: FastmailAddress[], subject: string, body: { text?: string; html?: string },
     options?: { cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
   ): Promise<void> {
+    this.#guard.requireWholeMailbox("send new mail");
     const grant = await this.#account.getGrant();
     await stageSend(this.#approvalQueue, this.#kv, {
       params: {
@@ -1088,6 +1303,7 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
   }
 
   async createDraft(draft: FastmailDraftInput): Promise<FastmailSendableDraft> {
+    this.#guard.requireWholeMailbox("draft new mail");
     const grant = await this.#account.getGrant();
     return createDraftRecord(
       { approvalQueue: this.#approvalQueue, account: this.#account, kv: this.#kv },
@@ -1145,12 +1361,24 @@ type SubscribeNewMessages = (
 @validateRpc()
 export class FastmailHookDeliveryImpl extends RpcTarget implements FastmailHookDelivery {
   constructor(
-    private readonly folderId: string,
+    /** The folder the hook watches; absent for a search binding's hook, which watches its search. */
+    private readonly folderId: string | undefined,
     private readonly account: DurableObjectStub<UserAccount>,
     private readonly kv: DurableObjectStorage["kv"],
     private readonly ai: Ai,
+    private readonly guard: ScopeGuard = new ScopeGuard(),
   ) {
     super();
+  }
+
+  async admits(emailId: string): Promise<boolean> {
+    if (!/^[A-Za-z0-9_-]{1,255}$/.test(emailId)) throw new TypeError("Invalid Fastmail email id.");
+    const grant = await this.account.getGrant();
+    const [info] = await getAdmissionInfo(
+      grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, [emailId]);
+    if (!info || info.keywords?.["$draft"]) return false;
+    if (this.folderId !== undefined && !info.mailboxIds?.[this.folderId]) return false;
+    return (await this.guard.admitInfos(grant, [info])).has(emailId);
   }
 
   async deliver(callback: RpcStub<FastmailMessageHookTarget>, approvalQueue: RpcStub<ApprovalQueue>,
@@ -1163,11 +1391,13 @@ export class FastmailHookDeliveryImpl extends RpcTarget implements FastmailHookD
       [email] = await getMessages(
         grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, [emailId]);
       // Deleted since it arrived, filed elsewhere, or not mail at all.
-      if (!email || email.id !== emailId || !email.mailboxIds?.[this.folderId] || email.keywords?.["$draft"]) {
-        return;
-      }
-      ({ messageIds } = await getThreadMetadata(
-        grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, email.threadId));
+      if (!email || email.id !== emailId || email.keywords?.["$draft"]) return;
+      if (this.folderId !== undefined && !email.mailboxIds?.[this.folderId]) return;
+      // The binding's own scope decides too: a search binding's hook sees only mail matching it.
+      if ((await this.guard.admit(grant, [emailId])).length === 0) return;
+      const thread = await getThreadMetadata(
+        grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, email.threadId);
+      messageIds = await this.guard.admit(grant, thread.messageIds);
     } catch (error) {
       if (error instanceof FastmailError && error.code === "AUTH_EXPIRED") {
         await this.account.noteCredentialsExpired();
@@ -1179,76 +1409,90 @@ export class FastmailHookDeliveryImpl extends RpcTarget implements FastmailHookD
     const message = toAgentMessage(email, getSimulatedKeywords(this.kv, email.id));
     await approvalQueue.authorizeObservation({
       title: `New Fastmail message: ${message.subject}`.slice(0, 200),
-      description: "Read a new message in the folder this hook watches: its sender, recipients, " +
+      description: "Read a new message this hook watches for: its sender, recipients, " +
         "date, subject, keywords, body, and attachments' names.",
     });
+    const ctx: CapabilityContext = { approvalQueue, account: this.account, kv: this.kv, ai: this.ai, guard: this.guard };
     using thread = new FastmailThreadImpl(
-      approvalQueue.dup(), this.account, this.kv, messageIds, this.ai);
-    await callback.receiveMessage({ message, folderId: this.folderId, thread });
+      approvalQueue.dup(), this.account, this.kv, messageIds.length > 0 ? messageIds : [emailId], this.ai, this.guard);
+    using ref = new FastmailMessageRefImpl({ ...ctx, approvalQueue: approvalQueue.dup() }, emailId);
+    await callback.receiveMessage({ message, folderId: this.folderId ?? null, thread, ref });
   }
 }
 
 // ---------------------------------------------------------------------------
-// ThreadImpl — the RPC interface exposed to the Gadget for one open thread
+// MessageSet — what a thread and a single message share: a fixed set of email ids, read and changed
+// only as far as the binding's scope admits them now.
 
-@validateRpc()
-export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
-  #approvalQueue: RpcStub<ApprovalQueue>;
-  #account: DurableObjectStub<UserAccount>;
-  #kv: DurableObjectStorage["kv"];
-  #messageIds: string[];
-  #ai: Ai;
+/** Everything a capability handed to the Gadget needs. */
+type CapabilityContext = {
+  approvalQueue: RpcStub<ApprovalQueue>;
+  account: DurableObjectStub<UserAccount>;
+  kv: DurableObjectStorage["kv"];
+  ai: Ai;
+  guard: ScopeGuard;
+};
 
-  constructor(
-      approvalQueue: RpcStub<ApprovalQueue>, account: DurableObjectStub<UserAccount>,
-      kv: DurableObjectStorage["kv"], messageIds: string[], ai: Ai) {
-    super();
-    this.#approvalQueue = approvalQueue;
-    this.#account = account;
-    this.#kv = kv;
-    this.#messageIds = messageIds;
-    this.#ai = ai;
-  }
-
-  [Symbol.dispose]() {
-    this.#approvalQueue[Symbol.dispose]();
-  }
-
-  async #call<T>(fn: () => Promise<T>): Promise<T> {
-    try {
-      return await fn();
-    } catch (error) {
-      logError("jmap.failed", error);
-      if (error instanceof FastmailError && error.code === "AUTH_EXPIRED") {
-        await this.#account.noteCredentialsExpired();
-        throw new Error(
-          "Fastmail's API token has expired or been revoked. Please reconnect the account.",
-          { cause: error });
-      }
-      throw error;
+async function callFastmail<T>(account: DurableObjectStub<UserAccount>, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (error) {
+    logError("jmap.failed", error);
+    if (error instanceof FastmailError && error.code === "AUTH_EXPIRED") {
+      await account.noteCredentialsExpired();
+      throw new Error(
+        "Fastmail's API token has expired or been revoked. Please reconnect the account.",
+        { cause: error });
     }
+    throw error;
+  }
+}
+
+class MessageSet {
+  constructor(
+    private readonly ctx: CapabilityContext,
+    /** The ids this capability was opened with, already admitted at the time. */
+    private readonly messageIds: string[],
+    /** "thread" or "message", for approval titles and descriptions. */
+    private readonly noun: "thread" | "message",
+  ) {}
+
+  #call<T>(fn: () => Promise<T>): Promise<T> {
+    return callFastmail(this.ctx.account, fn);
   }
 
+  /** The ids the scope still admits, refusing when none are left. */
+  async admitted(grant: StoredGrant): Promise<string[]> {
+    const ids = await this.#call(() => this.ctx.guard.admit(grant, this.messageIds));
+    if (ids.length === 0) throw outOfScope(this.noun === "thread" ? "That thread" : "That message");
+    return ids;
+  }
+
+  async emails(grant: StoredGrant): Promise<JmapEmailObject[]> {
+    const ids = await this.admitted(grant);
+    return this.#call(() => getMessages(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, ids));
+  }
 
   async messages(): Promise<FastmailMessage[]> {
-    const grant = await this.#account.getGrant();
-    const emails = await this.#call(() => getMessages(
-      grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, this.#messageIds));
-    await this.#approvalQueue.authorizeObservation({
-      title: "Read Fastmail thread",
-      description: `Read ${emails.length} message(s) in this thread.`,
+    const grant = await this.ctx.account.getGrant();
+    const emails = await this.emails(grant);
+    await this.ctx.approvalQueue.authorizeObservation({
+      title: this.noun === "thread" ? "Read Fastmail thread" : "Read Fastmail message",
+      description: this.noun === "thread"
+        ? `Read ${emails.length} message(s) in this thread.`
+        : "Read one message: its sender, recipients, date, subject, keywords, body, and attachments' names.",
     });
-    return emails.map(email => toAgentMessage(email, getSimulatedKeywords(this.#kv, email.id)));
+    return emails.map(email => toAgentMessage(email, getSimulatedKeywords(this.ctx.kv, email.id)));
   }
 
   async reply(
     body: { text?: string; html?: string },
     options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
   ): Promise<void> {
-    const grant = await this.#account.getGrant();
+    const grant = await this.ctx.account.getGrant();
     const from = requireSender(grant);
     const source = await this.#replySource(grant);
-    await stageSend(this.#approvalQueue, this.#kv, {
+    await stageSend(this.ctx.approvalQueue, this.ctx.kv, {
       params: { from, ...replyContent(source, from, body, options) },
       answersEmailId: source.id,
     }, "Reply to email");
@@ -1258,34 +1502,41 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
     body: { text?: string; html?: string },
     options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
   ): Promise<FastmailSendableDraft> {
-    const grant = await this.#account.getGrant();
+    const grant = await this.ctx.account.getGrant();
     const from = draftSender(grant);
     const source = await this.#replySource(grant);
     return createDraftRecord(
-      { approvalQueue: this.#approvalQueue, account: this.#account, kv: this.#kv },
+      { approvalQueue: this.ctx.approvalQueue, account: this.ctx.account, kv: this.ctx.kv },
       from, replyContent(source, from, body, options), source.id);
   }
 
+  /** The newest admitted message: what a reply answers. */
   async #replySource(grant: StoredGrant): Promise<JmapReplySource> {
+    const ids = await this.admitted(grant);
     const source = await this.#call(() => getReplySource(
-      grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, this.#messageIds));
-    if (!source) throw new FastmailError("RESOURCE_NOT_FOUND", "This thread has no message to reply to.");
+      grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, ids));
+    if (!source) throw new FastmailError("RESOURCE_NOT_FOUND", `This ${this.noun} has no message to reply to.`);
     return source;
   }
 
-  async readAttachment(blobId: string): Promise<ArrayBuffer> {
-    const grant = await this.#account.getGrant();
-    const emails = await this.#call(() => getMessages(
-      grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, this.#messageIds));
+  /** The attachment `blobId` names, refusing a blob that isn't on an admitted message here. */
+  async #attachment(grant: StoredGrant, blobId: string): Promise<JmapAttachment> {
+    const emails = await this.emails(grant);
     const attachment = emails.flatMap(email => email.attachments ?? []).find(a => a.blobId === blobId);
     if (!attachment) {
       throw new FastmailError(
-        "RESOURCE_NOT_FOUND", "That attachment does not belong to a message in this thread.");
+        "RESOURCE_NOT_FOUND", `That attachment does not belong to ${this.noun === "thread" ? "a message in this thread" : "this message"}.`);
     }
+    return attachment;
+  }
+
+  async readAttachment(blobId: string): Promise<ArrayBuffer> {
+    const grant = await this.ctx.account.getGrant();
+    const attachment = await this.#attachment(grant, blobId);
     const content = await this.#call(() => downloadBlob(
       grant.downloadUrlTemplate, grant.apiToken, grant.accountId, blobId,
       attachment.name ?? "attachment", attachment.type));
-    await this.#approvalQueue.authorizeObservation({
+    await this.ctx.approvalQueue.authorizeObservation({
       title: "Download Fastmail attachment",
       description: `Downloaded ${attachment.name ?? blobId} (${content.byteLength} bytes).`,
     });
@@ -1294,24 +1545,18 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
 
   /**
    * Reuses `readAttachment()`'s attachment lookup (still required on every call, cache hit or not
-   * -- it's what confirms `blobId` actually belongs to a message in this thread, not just any blob
+   * -- it's what confirms `blobId` actually belongs to an admitted message here, not just any blob
    * in the account). A `blobId`'s content is immutable, so a cache hit skips both the download and
    * the conversion.
    */
   async readAttachmentAsMarkdown(blobId: string): Promise<FastmailMarkdownContent> {
-    const grant = await this.#account.getGrant();
-    const emails = await this.#call(() => getMessages(
-      grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, this.#messageIds));
-    const attachment = emails.flatMap(email => email.attachments ?? []).find(a => a.blobId === blobId);
-    if (!attachment) {
-      throw new FastmailError(
-        "RESOURCE_NOT_FOUND", "That attachment does not belong to a message in this thread.");
-    }
+    const grant = await this.ctx.account.getGrant();
+    const attachment = await this.#attachment(grant, blobId);
     assertMarkdownConvertible(attachment.type, attachment.size);
 
-    const cached = getCachedAttachmentMarkdown(this.#kv, blobId);
+    const cached = getCachedAttachmentMarkdown(this.ctx.kv, blobId);
     if (cached) {
-      await this.#approvalQueue.authorizeObservation({
+      await this.ctx.approvalQueue.authorizeObservation({
         title: "Download Fastmail attachment as Markdown",
         description: `Converted ${attachment.name ?? blobId} to Markdown (cached).`,
       });
@@ -1321,10 +1566,10 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
     const content = await this.#call(() => downloadBlob(
       grant.downloadUrlTemplate, grant.apiToken, grant.accountId, blobId,
       attachment.name ?? "attachment", attachment.type));
-    const markdown = await convertToMarkdown(this.#ai, attachment.name ?? blobId, attachment.type, content);
+    const markdown = await convertToMarkdown(this.ctx.ai, attachment.name ?? blobId, attachment.type, content);
     const result: FastmailMarkdownContent = { markdown, sourceMimeType: attachment.type };
-    putCachedAttachmentMarkdown(this.#kv, blobId, result);
-    await this.#approvalQueue.authorizeObservation({
+    putCachedAttachmentMarkdown(this.ctx.kv, blobId, result);
+    await this.ctx.approvalQueue.authorizeObservation({
       title: "Download Fastmail attachment as Markdown",
       description: `Converted ${attachment.name ?? blobId} to Markdown (${content.byteLength} bytes source).`,
     });
@@ -1332,15 +1577,13 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
   }
 
   /**
-   * Who sent which of this thread's messages, so the approver can tell what a change touches.
+   * Who sent which of the target messages, so the approver can tell what a change touches.
    * Best-effort: a failed lookup leaves the description with the message count only, rather than
    * failing the action.
    */
-  async #messageSummaries(): Promise<MessageSummary[] | undefined> {
+  async #messageSummaries(grant: StoredGrant, ids: string[]): Promise<MessageSummary[] | undefined> {
     try {
-      const grant = await this.#account.getGrant();
-      const emails = await getMessages(
-        grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, this.#messageIds);
+      const emails = await getMessages(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, ids);
       return emails.map(email => ({
         from: email.from?.map(formatAddress).join(", ") || "(no sender)",
         subject: email.subject || "(no subject)",
@@ -1352,90 +1595,263 @@ export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
     }
   }
 
-  /** A folder's name for the approver, or its id when it can't be looked up. */
-  async #folderName(folderId: string): Promise<string> {
-    try {
-      const now = Date.now();
-      let folders = getCachedFolders(this.#kv, now);
-      if (!folders) {
-        const grant = await this.#account.getGrant();
-        folders = await listMailboxes(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission);
-        putCachedFolders(this.#kv, folders, now);
-      }
-      return folders.find(folder => folder.id === folderId)?.name ?? folderId;
-    } catch (error) {
-      logError("approval.folderLookupFailed", error);
-      return folderId;
+  /** The folders this binding may name, cached like `listFolders()`. */
+  async #visibleFolders(grant: StoredGrant): Promise<JmapMailboxObject[]> {
+    const now = Date.now();
+    let folders = getCachedFolders(this.ctx.kv, now);
+    if (!folders) {
+      folders = await this.#call(() =>
+        listMailboxes(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission));
+      putCachedFolders(this.ctx.kv, folders, now);
     }
+    return this.ctx.guard.visibleFolders(folders);
   }
 
-  async #submitPatch(
-      title: string, intro: string, patch: Record<string, unknown>,
-      extra: { label: string; value: string }[] = []): Promise<void> {
-    const summaries = await this.#messageSummaries();
-    const actionId = nextActionId(this.#kv);
-    setPendingAction(this.#kv, actionId, { kind: "patch", emailIds: this.#messageIds, patch });
-    // Not cleaned up on a thrown error — see the matching comment in FastmailSessionImpl.send():
-    // the overseer commits the action record before submitAction() returns, so deleting the local
-    // record on a failed await could orphan a genuinely-pending, still-approvable action.
-    await this.#approvalQueue.submitAction(actionId, {
-      title,
-      ...describeThreadChange(intro, this.#messageIds.length, summaries, extra),
+  #changeIntro(whole: string, single: string): string {
+    return this.noun === "thread" ? whole : single;
+  }
+
+  async moveToFolder(folderId: string): Promise<void> {
+    const grant = await this.ctx.account.getGrant();
+    let folderName: string;
+    try {
+      const folder = (await this.#visibleFolders(grant)).find(candidate => candidate.id === folderId);
+      // A narrowed binding may only file mail into the folders it can see (see ScopeGuard).
+      if (!folder && this.ctx.guard.restricted) throw outOfScope("That folder");
+      folderName = folder?.name ?? folderId;
+    } catch (error) {
+      if (this.ctx.guard.restricted) throw error;
+      // The whole mailbox may name any folder; the lookup only labels it for the approver.
+      logError("approval.folderLookupFailed", error);
+      folderName = folderId;
+    }
+    const ids = await this.admitted(grant);
+    const summaries = await this.#messageSummaries(grant, ids);
+    const patch = { mailboxIds: { [folderId]: true } };
+    const actionId = nextActionId(this.ctx.kv);
+    setPendingAction(this.ctx.kv, actionId, { kind: "patch", emailIds: ids, patch });
+    // Not cleaned up on a thrown error — see the matching comment in stageSend(): the overseer
+    // commits the action record before submitAction() returns, so deleting the local record on a
+    // failed await could orphan a genuinely-pending, still-approvable action.
+    await this.ctx.approvalQueue.submitAction(actionId, {
+      title: this.noun === "thread" ? "Move Fastmail thread" : "Move Fastmail message",
+      ...describeThreadChange(
+        this.#changeIntro("Move every message in this thread to another folder.", "Move this message to another folder."),
+        ids.length, summaries, [{ label: "To folder", value: folderName }]),
       implementsRevert: false,
       ...autoApprovable(AUTO_APPROVABLE_KINDS.move),
     });
   }
 
-  async moveToFolder(folderId: string): Promise<void> {
-    const folder = await this.#folderName(folderId);
-    await this.#submitPatch(
-      "Move Fastmail thread", "Move every message in this thread to another folder.",
-      { mailboxIds: { [folderId]: true } }, [{ label: "To folder", value: folder }]);
-  }
-
-  async #patchKeyword(keyword: string, present: boolean, title: string): Promise<void> {
-    const summaries = await this.#messageSummaries();
-    const actionId = nextActionId(this.#kv);
-    setPendingAction(this.#kv, actionId, {
+  async patchKeyword(keyword: string, present: boolean): Promise<void> {
+    const grant = await this.ctx.account.getGrant();
+    const ids = await this.admitted(grant);
+    const summaries = await this.#messageSummaries(grant, ids);
+    const actionId = nextActionId(this.ctx.kv);
+    setPendingAction(this.ctx.kv, actionId, {
       kind: "patch",
-      emailIds: this.#messageIds,
+      emailIds: ids,
       patch: { [`keywords/${keyword}`]: present ? true : null },
     });
-    for (const emailId of this.#messageIds) {
-      setSimulatedKeywords(this.#kv, emailId, actionId, { [keyword]: present });
+    for (const emailId of ids) {
+      setSimulatedKeywords(this.ctx.kv, emailId, actionId, { [keyword]: present });
     }
     // Neither the pending action record nor the simulated overlay is cleaned up on a thrown error —
-    // see the matching comment in FastmailSessionImpl.send(): the overseer commits the action record
-    // before submitAction() returns, so a failure reaching this await can mean the submission
-    // actually succeeded server-side. Clearing either here could desync this session's view (or
-    // orphan a still-approvable action) from what the overseer actually recorded.
-    await this.#approvalQueue.submitAction(actionId, {
+    // see the matching comment in stageSend(): the overseer commits the action record before
+    // submitAction() returns, so a failure reaching this await can mean the submission actually
+    // succeeded server-side. Clearing either here could desync this session's view (or orphan a
+    // still-approvable action) from what the overseer actually recorded.
+    const noun = this.noun === "thread" ? "thread" : "message";
+    const title = keyword === "$seen"
+      ? `Mark Fastmail ${noun} ${present ? "read" : "unread"}`
+      : present ? "Add Fastmail keyword" : "Remove Fastmail keyword";
+    const intro = keyword === "$seen"
+      ? this.#changeIntro(
+        `Mark every message in this thread as ${present ? "read" : "unread"}.`,
+        `Mark this message as ${present ? "read" : "unread"}.`)
+      : this.#changeIntro(
+        `${present ? "Add a keyword to" : "Remove a keyword from"} every message in this thread.`,
+        `${present ? "Add a keyword to" : "Remove a keyword from"} this message.`);
+    await this.ctx.approvalQueue.submitAction(actionId, {
       title,
       ...describeThreadChange(
-        keyword === "$seen"
-          ? `Mark every message in this thread as ${present ? "read" : "unread"}.`
-          : `${present ? "Add a keyword to" : "Remove a keyword from"} every message in this thread.`,
-        this.#messageIds.length, summaries,
-        keyword === "$seen" ? [] : [{ label: "Keyword", value: keyword }]),
+        intro, ids.length, summaries, keyword === "$seen" ? [] : [{ label: "Keyword", value: keyword }]),
       implementsRevert: false,
       ...autoApprovable(keyword === "$seen" ? AUTO_APPROVABLE_KINDS.readState : AUTO_APPROVABLE_KINDS.keyword),
     });
   }
+}
 
-  async addKeyword(keyword: string): Promise<void> {
-    await this.#patchKeyword(keyword, true, "Add Fastmail keyword");
+// ---------------------------------------------------------------------------
+// ThreadImpl — the RPC interface exposed to the Gadget for one open thread
+
+@validateRpc()
+export class FastmailThreadImpl extends RpcTarget implements FastmailThread {
+  #ctx: CapabilityContext;
+  #set: MessageSet;
+
+  constructor(
+      approvalQueue: RpcStub<ApprovalQueue>, account: DurableObjectStub<UserAccount>,
+      kv: DurableObjectStorage["kv"], messageIds: string[], ai: Ai, guard: ScopeGuard = new ScopeGuard()) {
+    super();
+    this.#ctx = { approvalQueue, account, kv, ai, guard };
+    this.#set = new MessageSet(this.#ctx, messageIds, "thread");
   }
 
-  async removeKeyword(keyword: string): Promise<void> {
-    await this.#patchKeyword(keyword, false, "Remove Fastmail keyword");
+  [Symbol.dispose]() {
+    this.#ctx.approvalQueue[Symbol.dispose]();
   }
 
-  async markRead(): Promise<void> {
-    await this.#patchKeyword("$seen", true, "Mark Fastmail thread read");
+  messages(): Promise<FastmailMessage[]> {
+    return this.#set.messages();
   }
 
-  async markUnread(): Promise<void> {
-    await this.#patchKeyword("$seen", false, "Mark Fastmail thread unread");
+  reply(
+    body: { text?: string; html?: string },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+  ): Promise<void> {
+    return this.#set.reply(body, options);
+  }
+
+  createReplyDraft(
+    body: { text?: string; html?: string },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+  ): Promise<FastmailSendableDraft> {
+    return this.#set.createReplyDraft(body, options);
+  }
+
+  readAttachment(blobId: string): Promise<ArrayBuffer> {
+    return this.#set.readAttachment(blobId);
+  }
+
+  readAttachmentAsMarkdown(blobId: string): Promise<FastmailMarkdownContent> {
+    return this.#set.readAttachmentAsMarkdown(blobId);
+  }
+
+  moveToFolder(folderId: string): Promise<void> {
+    return this.#set.moveToFolder(folderId);
+  }
+
+  addKeyword(keyword: string): Promise<void> {
+    return this.#set.patchKeyword(keyword, true);
+  }
+
+  removeKeyword(keyword: string): Promise<void> {
+    return this.#set.patchKeyword(keyword, false);
+  }
+
+  markRead(): Promise<void> {
+    return this.#set.patchKeyword("$seen", true);
+  }
+
+  markUnread(): Promise<void> {
+    return this.#set.patchKeyword("$seen", false);
+  }
+}
+
+/** Opens a thread capability over the messages of `threadId` the guard admits, or refuses. */
+async function openThread(ctx: CapabilityContext, grant: StoredGrant, threadId: string): Promise<FastmailThreadImpl> {
+  let metadata: { messageIds: string[] };
+  try {
+    metadata = await callFastmail(ctx.account, () =>
+      getThreadMetadata(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, threadId));
+  } catch (error) {
+    // The same refusal as for a thread outside the scope, so a narrowed binding can't probe ids.
+    if (error instanceof FastmailError && error.code === "RESOURCE_NOT_FOUND") throw outOfScope("That thread");
+    throw error;
+  }
+  const admitted = await callFastmail(ctx.account, () => ctx.guard.admit(grant, metadata.messageIds));
+  if (admitted.length === 0) throw outOfScope("That thread");
+  return new FastmailThreadImpl(ctx.approvalQueue.dup(), ctx.account, ctx.kv, admitted, ctx.ai, ctx.guard);
+}
+
+// ---------------------------------------------------------------------------
+// MessageRefImpl — the RPC interface exposed to the Gadget for one message
+
+@validateRpc()
+export class FastmailMessageRefImpl extends RpcTarget implements FastmailMessageRef {
+  #ctx: CapabilityContext;
+  #emailId: string;
+  #set: MessageSet;
+
+  constructor(ctx: CapabilityContext, emailId: string) {
+    super();
+    this.#ctx = ctx;
+    this.#emailId = emailId;
+    this.#set = new MessageSet(ctx, [emailId], "message");
+  }
+
+  [Symbol.dispose]() {
+    this.#ctx.approvalQueue[Symbol.dispose]();
+  }
+
+  async read(): Promise<FastmailMessage> {
+    const [message] = await this.#set.messages();
+    if (!message) throw outOfScope("That message");
+    return message;
+  }
+
+  async getHeaders(): Promise<{ name: string; value: string }[]> {
+    const grant = await this.#ctx.account.getGrant();
+    await this.#set.admitted(grant);
+    const headers = await callFastmail(this.#ctx.account, () => getEmailHeaders(
+      grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, this.#emailId));
+    await this.#ctx.approvalQueue.authorizeObservation({
+      title: "Read Fastmail message headers",
+      description: `Read all ${headers.length} header field(s) of one message.`,
+    });
+    return headers;
+  }
+
+  async thread(): Promise<FastmailThread> {
+    const grant = await this.#ctx.account.getGrant();
+    await this.#set.admitted(grant);
+    const [info] = await callFastmail(this.#ctx.account, () => getAdmissionInfo(
+      grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, [this.#emailId]));
+    if (!info) throw outOfScope("That message");
+    return openThread(this.#ctx, grant, info.threadId);
+  }
+
+  readAttachment(blobId: string): Promise<ArrayBuffer> {
+    return this.#set.readAttachment(blobId);
+  }
+
+  readAttachmentAsMarkdown(blobId: string): Promise<FastmailMarkdownContent> {
+    return this.#set.readAttachmentAsMarkdown(blobId);
+  }
+
+  moveToFolder(folderId: string): Promise<void> {
+    return this.#set.moveToFolder(folderId);
+  }
+
+  addKeyword(keyword: string): Promise<void> {
+    return this.#set.patchKeyword(keyword, true);
+  }
+
+  removeKeyword(keyword: string): Promise<void> {
+    return this.#set.patchKeyword(keyword, false);
+  }
+
+  markRead(): Promise<void> {
+    return this.#set.patchKeyword("$seen", true);
+  }
+
+  markUnread(): Promise<void> {
+    return this.#set.patchKeyword("$seen", false);
+  }
+
+  reply(
+    body: { text?: string; html?: string },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+  ): Promise<void> {
+    return this.#set.reply(body, options);
+  }
+
+  createReplyDraft(
+    body: { text?: string; html?: string },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+  ): Promise<FastmailSendableDraft> {
+    return this.#set.createReplyDraft(body, options);
   }
 }
 

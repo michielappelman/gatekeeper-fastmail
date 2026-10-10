@@ -59,7 +59,10 @@ function setup(env: { BASE_URL?: string } = {}) {
   const { storage, store, account, alarm } = fakeStorage();
   const driver = new HookDriver(storage as any, env as any, () => account);
   const delivered: string[] = [];
-  const delivery = { deliver: vi.fn(async (_callback: unknown, _queue: unknown, id: string) => void delivered.push(id)) };
+  const delivery = {
+    admits: vi.fn(async (_id: string) => true),
+    deliver: vi.fn(async (_callback: unknown, _queue: unknown, id: string) => void delivered.push(id)),
+  };
   const initiator = {
     startHook: vi.fn(async () => ({ callback: {}, approvalQueue: {}, [Symbol.dispose]() {} })),
   };
@@ -112,6 +115,24 @@ describe("FastmailHookDriver polling", () => {
     store.set("syncAt", 0);
     await driver.alarm();
     expect(delivered).toEqual(["e1"]);
+  });
+
+  it("starts no firing for mail the binding doesn't admit", async () => {
+    const { driver, store, register, delivered, delivery } = setup();
+    fakeJmap({ "Email/get": STATE_HANDLER });
+    await register("hook1");
+    const since = (store.get("reg:hook1") as { since: number }).since;
+    fakeJmap({
+      "Email/changes": () => ["Email/changes", { newState: "s2", hasMoreChanges: false, created: ["e1"] }],
+      "Email/get": () => ["Email/get", { list: [
+        { id: "e1", mailboxIds: { "inbox-id": true }, keywords: {}, receivedAt: new Date(since + 1000).toISOString() },
+      ] }],
+    });
+    delivery.admits.mockImplementation(async () => false);
+    store.set("syncAt", 0);
+    await driver.alarm();
+    expect(delivery.admits).toHaveBeenCalledWith("e1");
+    expect(delivered).toEqual([]);
   });
 
   it("watches from now when Fastmail can no longer compute changes", async () => {

@@ -37,11 +37,19 @@ type Env = Cloudflare.Env & { BASE_URL?: string };
 
 export type FastmailMessageHookTarget = RpcTarget & FastmailMessageHook<any>;
 
-/** Where a hook delivers, sealed into its delivery stub by the facet's `ctx.restore()`. */
-export type FastmailHookParams = { folderId: string };
+/**
+ * Where a hook delivers, sealed into its delivery stub by the facet's `ctx.restore()`: a folder,
+ * or (`{}`) whatever a search binding's search admits.
+ */
+export type FastmailHookParams = { folderId?: string };
 
 /** What a hook's delivery stub reaches: the connection's facet, narrowed to delivering. */
 export interface FastmailHookDelivery extends RpcTarget {
+  /**
+   * Whether email `emailId` is new mail the hook watches for, checked before a firing is started:
+   * a search binding's hook can't be prefiltered by folder, and every firing wakes its workspace.
+   */
+  admits(emailId: string): Promise<boolean>;
   /**
    * Deliver email `emailId` to one firing of the hook if it is new mail in the hook's folder;
    * otherwise return without calling it.
@@ -98,7 +106,8 @@ const PUSH_RETRY_MS = HOUR_MS;
 const PUSH_TYPES = ["EmailDelivery"];
 
 type Registration = {
-  folderId: string;
+  /** The folder new mail must arrive in; absent for a search binding, whose facet decides. */
+  folderId?: string;
   userObjectId: string;
   /** When the hook was enabled: mail Fastmail received earlier is never delivered to it. */
   since: number;
@@ -339,7 +348,7 @@ export class HookDriver {
     if (email.keywords?.["$draft"]) return;
     const receivedAt = Date.parse(email.receivedAt);
     for (const [regKey, registration] of registrations) {
-      if (!email.mailboxIds?.[registration.folderId]) continue;
+      if (registration.folderId !== undefined && !email.mailboxIds?.[registration.folderId]) continue;
       if (receivedAt < registration.since) continue;
       this.#queue.enqueue(regKey.slice("reg:".length), email.id, email.id, Date.now());
     }
@@ -350,6 +359,7 @@ export class HookDriver {
     const capabilities = this.storage.kv.get<Capabilities>(capabilitiesKey(hookKey));
     if (!capabilities) return;
     try {
+      if (!await capabilities.delivery.admits(emailId)) return;
       // A refused firing is retried like a failed one, being indistinguishable from a transient
       // failure; disabling or deleting the hook unregisters it, which ends the retries.
       using hook = await capabilities.initiator.startHook();

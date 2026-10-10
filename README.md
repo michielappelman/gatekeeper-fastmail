@@ -77,24 +77,56 @@ There is no refresh cycle (unlike an OAuth grant): the token is live until revok
 settings, or an API call returns 401, which is reported to the Workshop via
 `GatekeeperConnectCallback.credentialsExpired()`.
 
-## Resource model (whole mailbox)
+## Resource model (whole mailbox, folder, or saved search)
 
-`FASTMAIL_RESOURCE` offers exactly one bindable resource per connected account: the whole mailbox
-(`resource.ts`). There is no per-folder or per-search scoping yet. The resource's `urlPattern`
-reserves room for `#mailbox/<id>` / `#search/<query>` hash-scoped variants without needing to migrate
-any binding this version creates.
+`FASTMAIL_RESOURCE` (`resource.ts`) is one resource per connected account, narrowed by the URL's
+hash. The `urlPattern` is unchanged, so whole-mailbox bindings created before scopes existed keep
+their URL and meaning:
 
-Even though there's nothing to actually pick, the connect modal still requires a working
-`GatekeeperUser.startResourceConfigurator()` for every `SupportedResource` before "Add connection"
-can be enabled — there's no way to opt a resource out of it. So `configurator/
-fastmail-account-configurator-ui.tsx` is a trivial (zero-field, always-`isReady`) configurator that
-just confirms what's being connected and reports the fixed resource URL, the same pattern
-`gatekeeper-zoominfo`'s whole-account resource uses.
+| Binding | Resource URL | Session type |
+|---|---|---|
+| Whole mailbox | `https://api.fastmail.com/jmap/mail/account` | `FastmailSession` / `FastmailDraftOnlySession` |
+| One folder | `…/account#mailbox/<JMAP Mailbox id>` | `FastmailScopedSession` / `FastmailScopedDraftOnlySession` |
+| Saved search | `…/account#search/<percent-encoded canonical JSON filter>` | as for a folder |
+
+A folder binding admits the messages currently in that folder (not its subfolders); mailbox ids
+survive renames. A saved search is a structured filter (`from`, `to`, `subject`, `text`,
+`hasKeyword`, `folderId`, `after`, `before`; at least one), mapped to a JMAP `FilterCondition`, never
+a free-text query string, so the gatekeeper can check a single message against it.
+
+`src/scope.ts`'s `ScopeGuard` enforces the scope everywhere, the way gatekeeper-google's label and
+search bindings do:
+
+- listings and searches get the scope ANDed into their `Email/query` filter; asking a folder binding
+  for another folder is refused;
+- every thread, message and hook capability re-checks admission on each read or change, so a
+  message that leaves the folder or stops matching the search leaves scope; a thread shows only its
+  admitted messages, and changes, attachments and replies reach only those;
+- a search scope's admission is decided by Fastmail itself: one `Email/query` for the stored filter
+  AND the emails' `Message-ID` headers (RFC 8621 `header` condition). Mail without a Message-ID is
+  never admitted;
+- a narrowed binding sees only its own folder and the system folders (`role` set) in
+  `listFolders()`, and may move mail only into those;
+- a narrowed binding can't write new mail (`send()`, `createDraft()`), but can reply, or draft a
+  reply, to messages in scope;
+- ids outside the scope are refused exactly like ids that don't exist.
+
+A whole-mailbox guard admits everything without a network round trip, so whole-mailbox bindings
+behave as before.
+
+The configurator (`configurator/fastmail-account-configurator-ui.tsx`) offers the three modes; the
+folder list comes from the account through the configurator RPC, which also mints and parses the
+resource URL (`FastmailAccountConfiguratorUI`), so the sandboxed module never re-implements the
+encoding.
 
 ## Session API
 
 See `types.d.ts` for the full agent-facing surface: `FastmailSession.listFolders/listThreads/
-searchThreads/getThread/send/createDraft/listDrafts/getDraft/subscribeNewMessages`, `FastmailThread.messages/reply/
+searchThreads/getThread/listMessages/searchMessages/getMessage/send/createDraft/listDrafts/getDraft/
+subscribeNewMessages`, `FastmailMessageRef.read/getHeaders/thread/readAttachment/
+readAttachmentAsMarkdown/moveToFolder/addKeyword/removeKeyword/markRead/markUnread/reply/
+createReplyDraft` (one message, where the thread verbs act on the whole thread and a thread reply
+answers its newest message), `FastmailThread.messages/reply/
 createReplyDraft/readAttachment/moveToFolder/addKeyword/removeKeyword/markRead/markUnread`, and
 `FastmailSendableDraft.getMetadata/getContent/update/delete/send`. Deliberately no Gmail-style
 `archive()`/`trash()` convenience verbs — call `listFolders()`, find the folder whose `role` is
@@ -206,7 +238,8 @@ has no per-observer ACL Fastmail exposes to check a second connected account aga
 
 ## Current scope
 
-- Resource scope is the whole mailbox; per-folder and per-search binding selection is not exposed.
+- A folder binding covers one folder, not its subfolders; a saved search uses JMAP filter fields,
+  not Fastmail's web search syntax.
 - New-mail hooks watch one folder each and report new mail only, not moves, flag changes or
   deletions.
 - Drafts and sends carry no attachments.

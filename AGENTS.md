@@ -41,7 +41,8 @@ The important code paths are:
 src/fastmail.ts       Worker entrypoint, UserAccount, gatekeeper DO, sessions, configurator
 src/fastmail-api.ts   Direct JMAP fetch client and Fastmail session discovery
 src/fastmail-types.ts JMAP wire types and capability constants
-src/resource.ts       Whole-mailbox resource URL and validation
+src/resource.ts       Resource URL: whole mailbox, folder or saved search; parsing and validation
+src/scope.ts          ScopeGuard: what a binding admits, enforced on every path
 src/cache.ts          Folder cache, pending actions, simulated keyword overlays, draft records
 src/drafts.ts         Draft revision ordering: what the agent sees, apply and reject
 src/errors.ts         Stable FastmailErrorCode mapping
@@ -54,13 +55,15 @@ __tests__/             JMAP, resource, cache, and configurator tests
 
 ## Non-negotiable invariants
 
-- v1 exposes exactly one resource URL: `https://api.fastmail.com/jmap/mail/account`. The
-  `urlPattern` is deployed identity; do not change it casually.
-- Resource parsing must reject foreign hosts, paths, malformed URLs, and hash-scoped variants.
-  Per-folder and per-search bindings are not implemented, even though the URL pattern leaves room
-  for them later.
-- The resource is one connected account's whole mailbox. Do not infer authorization from a folder
-  or thread id; the account binding is the capability boundary.
+- The resource URL is `https://api.fastmail.com/jmap/mail/account`, optionally narrowed by
+  `#mailbox/<id>` (one folder) or `#search/<canonical JSON filter>` (a saved search). The
+  `urlPattern` and the bare whole-mailbox URL are deployed identity; never change their meaning.
+- Resource parsing must reject foreign hosts, paths, query strings, malformed URLs, unknown hash
+  forms, unknown search fields, and empty searches.
+- The binding's `ScopeGuard` (`src/scope.ts`) is the capability boundary. Every read and change goes
+  through it, including threads, single messages, attachments, replies, folder moves and hook
+  deliveries; never infer authorization from a folder, thread or message id. Out-of-scope ids must
+  be refused exactly like missing ones. Narrowed bindings can't write new mail.
 - `UserAccount` owns the Fastmail API token and resolved JMAP account information. The token must
   not reach agent-facing session objects.
 - Fastmail API tokens are bearer tokens, not OAuth grants. There is no refresh cycle. A 401 must

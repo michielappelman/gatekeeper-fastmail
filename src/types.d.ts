@@ -111,25 +111,48 @@ export type FastmailDraftInfo = {
   updatedAt: Date;
 };
 
+/** One message in a message listing or search result, without its bodies. */
+export type FastmailMessageEntry<Ref = FastmailMessageRef> = {
+  /** The message's id: pass it to `getMessage()`. */
+  id: string;
+  /** Pass this to `getThread()`. */
+  threadId: string;
+  subject: string;
+  /** Display-formatted sender. */
+  from: string;
+  receivedAt: Date;
+  unread: boolean;
+  /** Short plain-text preview. */
+  snippet: string;
+  /** JMAP keywords on this message, e.g. `"$seen"`, `"$flagged"`. */
+  keywords: string[];
+  /** Opens this message: the same capability `getMessage(id)` returns. */
+  ref: Ref;
+};
+
 /** A new message, as delivered to a `FastmailMessageHook`. */
-export type FastmailNewMessage<Thread = FastmailThread> = {
+export type FastmailNewMessage<Thread = FastmailThread, Ref = FastmailMessageRef> = {
   /** The message, with its bodies and attachments' metadata. */
   message: FastmailMessage;
-  /** The folder the hook watches, which the message arrived in. */
-  folderId: string;
+  /** The folder the hook watches, which the message arrived in; null for a saved-search binding's
+   * hook. */
+  folderId: string | null;
   /** The message's thread: reply, draft a reply, or organize it. Writes are queued for approval,
    * and it is released when `receiveMessage()` returns. */
   thread: Thread;
+  /** The new message itself, to reply to or organize just this message. Released when
+   * `receiveMessage()` returns. */
+  ref: Ref;
 };
 
 /** Implemented by a gadget to receive new mail; see `FastmailDraftOnlySession.subscribeNewMessages()`. */
-export interface FastmailMessageHook<Thread = FastmailThread> {
+export interface FastmailMessageHook<Thread = FastmailThread, Ref = FastmailMessageRef> {
   /**
    * Called with each new message. Delivery is at least once and unordered, and a message this
    * throws for is retried with backoff, eight attempts in all, so key any work on
    * `entry.message.id` to keep it idempotent. Disabling the hook ends its retries.
    */
-  receiveMessage(entry: FastmailNewMessage<Thread>): Promise<void>;
+  receiveMessage(entry: FastmailNewMessage<Thread, Ref>): Promise<void>;
 }
 
 /**
@@ -203,6 +226,20 @@ export interface FastmailDraftOnlySession {
   /** Opens one thread by id (from a `FastmailThreadEntry.threadId`). */
   getThread(threadId: string): Promise<FastmailDraftOnlyThread>;
 
+  /**
+   * Lists individual messages, newest first, rather than one entry per thread. Omit `folderId` to
+   * list across the whole mailbox.
+   */
+  listMessages(folderId?: string): Promise<Cursor<FastmailMessageEntry<FastmailDraftOnlyMessageRef>>>;
+
+  /** Full-text searches individual messages, newest first. Omit `folderId` to search the whole mailbox. */
+  searchMessages(
+    query: string, folderId?: string,
+  ): Promise<Cursor<FastmailMessageEntry<FastmailDraftOnlyMessageRef>>>;
+
+  /** Opens one message by id (from a `FastmailMessageEntry.id` or `FastmailMessage.id`). */
+  getMessage(id: string): Promise<FastmailDraftOnlyMessageRef>;
+
   /** Creates a new draft in the Drafts folder. Nothing is sent. */
   createDraft(draft: FastmailDraftInput): Promise<FastmailDraft>;
 
@@ -250,7 +287,8 @@ export interface FastmailDraftOnlySession {
    * }
    */
   subscribeNewMessages(
-    hook: RpcStub<FastmailMessageHook<FastmailDraftOnlyThread>>, options?: { folderId?: string },
+    hook: RpcStub<FastmailMessageHook<FastmailDraftOnlyThread, FastmailDraftOnlyMessageRef>>,
+    options?: { folderId?: string },
   ): Promise<void>;
 }
 
@@ -267,9 +305,18 @@ export interface FastmailSession extends FastmailDraftOnlySession {
 
   /** Reopens a draft by its `FastmailDraftInfo.id`. */
   getDraft(id: string): Promise<FastmailSendableDraft>;
-  /** As `FastmailDraftOnlySession.subscribeNewMessages()`, with a thread that can also reply. */
+  /** Opens one message by id (from a `FastmailMessageEntry.id` or `FastmailMessage.id`). */
+  getMessage(id: string): Promise<FastmailMessageRef>;
+
+  /** As `FastmailDraftOnlySession.listMessages()`, with messages that can also be replied to. */
+  listMessages(folderId?: string): Promise<Cursor<FastmailMessageEntry>>;
+
+  /** As `FastmailDraftOnlySession.searchMessages()`, with messages that can also be replied to. */
+  searchMessages(query: string, folderId?: string): Promise<Cursor<FastmailMessageEntry>>;
+
+  /** As `FastmailDraftOnlySession.subscribeNewMessages()`, with a thread and message that can also reply. */
   subscribeNewMessages(
-    hook: RpcStub<FastmailMessageHook<FastmailThread>>, options?: { folderId?: string },
+    hook: RpcStub<FastmailMessageHook<FastmailThread, FastmailMessageRef>>, options?: { folderId?: string },
   ): Promise<void>;
 
   /**
@@ -368,4 +415,115 @@ export interface FastmailThread extends FastmailDraftOnlyThread {
     body: { text?: string; html?: string },
     options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
   ): Promise<FastmailSendableDraft>;
+}
+
+/**
+ * One message, for an account that can prepare drafts but not send: read it, organize just this
+ * message, or draft a reply to it.
+ */
+export interface FastmailDraftOnlyMessageRef {
+  /** The message, with its bodies and attachments' metadata. */
+  read(): Promise<FastmailMessage>;
+  /** Every raw header field of the message, in order (e.g. `List-Id`, `Received`, `Authentication-Results`). */
+  getHeaders(): Promise<{ name: string; value: string }[]>;
+  /** The message's thread, as far as this connection can see it. */
+  thread(): Promise<FastmailDraftOnlyThread>;
+  /** Downloads one of this message's attachments, by the `blobId` from `FastmailMessage.attachments`. */
+  readAttachment(blobId: string): Promise<ArrayBuffer>;
+  /** As `FastmailDraftOnlyThread.readAttachmentAsMarkdown()`, for one of this message's attachments. */
+  readAttachmentAsMarkdown(blobId: string): Promise<FastmailMarkdownContent>;
+  /** Moves just this message into `folderId` (from `FastmailFolder.id`). */
+  moveToFolder(folderId: string): Promise<void>;
+  /** Adds a JMAP keyword (e.g. `"$flagged"`) to just this message. */
+  addKeyword(keyword: string): Promise<void>;
+  /** Removes a JMAP keyword from just this message. */
+  removeKeyword(keyword: string): Promise<void>;
+  /** Marks just this message as read. */
+  markRead(): Promise<void>;
+  /** Marks just this message as unread. */
+  markUnread(): Promise<void>;
+  /**
+   * Creates a draft reply to this message (not necessarily the thread's newest), threaded and
+   * addressed as `FastmailMessageRef.reply()` would send it. Nothing is sent.
+   */
+  createReplyDraft(
+    body: { text?: string; html?: string },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+  ): Promise<FastmailDraft>;
+}
+
+/** One message: read it, organize just this message, or reply to it. */
+export interface FastmailMessageRef extends FastmailDraftOnlyMessageRef {
+  /** The message's thread, as far as this connection can see it. */
+  thread(): Promise<FastmailThread>;
+  /**
+   * Queues a reply to this message (not necessarily the thread's newest), threaded properly and
+   * addressed as `FastmailThread.reply()` describes. Resolves once the reply is queued.
+   */
+  reply(
+    body: { text?: string; html?: string },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+  ): Promise<void>;
+  /** As `FastmailDraftOnlyMessageRef.createReplyDraft()`, with a draft that can also be sent. */
+  createReplyDraft(
+    body: { text?: string; html?: string },
+    options?: { replyAll?: boolean; cc?: FastmailAddress[]; bcc?: FastmailAddress[] },
+  ): Promise<FastmailSendableDraft>;
+}
+
+/**
+ * Access to part of one connected Fastmail account: the messages in one folder, or the messages
+ * matching one saved search, chosen when this connection was created. Nothing else in the mailbox
+ * is visible: listings, searches and hooks cover only those messages, and a thread shows only its
+ * messages that are within scope. A message that leaves the folder, or stops matching the search,
+ * leaves scope too. This connection can't write new mail, but can reply to messages in scope (as
+ * drafts, for this account).
+ */
+export interface FastmailScopedDraftOnlySession {
+  /**
+   * Lists the folders this connection may use: its own folder, and Fastmail's system folders
+   * (Inbox, Archive, Trash, Junk, Sent, Drafts) to move mail into.
+   */
+  listFolders(): Promise<FastmailFolder[]>;
+  /** Lists threads in scope, newest first. `folderId` narrows a saved search to one folder. */
+  listThreads(folderId?: string): Promise<Cursor<FastmailThreadEntry>>;
+  /** Full-text searches threads in scope, newest first. */
+  searchThreads(query: string, folderId?: string): Promise<Cursor<FastmailThreadEntry>>;
+  /** Opens one thread by id, showing only its messages in scope. */
+  getThread(threadId: string): Promise<FastmailDraftOnlyThread>;
+  /** Lists messages in scope, newest first. */
+  listMessages(folderId?: string): Promise<Cursor<FastmailMessageEntry<FastmailDraftOnlyMessageRef>>>;
+  /** Full-text searches messages in scope, newest first. */
+  searchMessages(
+    query: string, folderId?: string,
+  ): Promise<Cursor<FastmailMessageEntry<FastmailDraftOnlyMessageRef>>>;
+  /** Opens one message in scope by id. */
+  getMessage(id: string): Promise<FastmailDraftOnlyMessageRef>;
+  /** Lists the drafts created through this connection that are still drafts, oldest first. */
+  listDrafts(): Promise<FastmailDraftInfo[]>;
+  /** Reopens a draft by its `FastmailDraftInfo.id`. */
+  getDraft(id: string): Promise<FastmailDraft>;
+  /**
+   * Have `hook.receiveMessage()` called with each new message arriving in scope: in the folder, or
+   * matching the saved search. Otherwise as `FastmailDraftOnlySession.subscribeNewMessages()`.
+   */
+  subscribeNewMessages(
+    hook: RpcStub<FastmailMessageHook<FastmailDraftOnlyThread, FastmailDraftOnlyMessageRef>>,
+  ): Promise<void>;
+}
+
+/** As `FastmailScopedDraftOnlySession`, for an account that can also send replies. */
+export interface FastmailScopedSession extends FastmailScopedDraftOnlySession {
+  /** Opens one thread by id, showing only its messages in scope. */
+  getThread(threadId: string): Promise<FastmailThread>;
+  /** Lists messages in scope, newest first. */
+  listMessages(folderId?: string): Promise<Cursor<FastmailMessageEntry>>;
+  /** Full-text searches messages in scope, newest first. */
+  searchMessages(query: string, folderId?: string): Promise<Cursor<FastmailMessageEntry>>;
+  /** Opens one message in scope by id. */
+  getMessage(id: string): Promise<FastmailMessageRef>;
+  /** Reopens a draft by its `FastmailDraftInfo.id`. */
+  getDraft(id: string): Promise<FastmailSendableDraft>;
+  /** As `FastmailScopedDraftOnlySession.subscribeNewMessages()`, with a thread and message that can also reply. */
+  subscribeNewMessages(hook: RpcStub<FastmailMessageHook<FastmailThread, FastmailMessageRef>>): Promise<void>;
 }
