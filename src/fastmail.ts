@@ -57,6 +57,7 @@ import {
 } from "./cache";
 import { applyDraftRevision, currentDraft, rejectDraftRevision, toDraftInfo } from "./drafts";
 import { collectAttachmentGarbage, prepareAttachments, uploadAttachments } from "./attachments";
+import { bulkSignals } from "./bulk";
 import { FastmailError } from "./errors";
 import { assertMarkdownConvertible, convertToMarkdown } from "./markdown";
 import {
@@ -680,6 +681,7 @@ function toMessageEntry(
     unread: !keywords["$seen"],
     snippet: raw.preview,
     keywords: Object.keys(keywords).filter(keyword => keywords[keyword]),
+    bulk: bulkSignals(raw),
     ref,
   };
 }
@@ -711,6 +713,7 @@ function toAgentMessage(email: JmapEmailObject, keywordOverlay: Record<string, b
     htmlBody: htmlPartId ? email.bodyValues?.[htmlPartId]?.value : undefined,
     attachments,
     keywords: Object.keys(keywords).filter(keyword => keywords[keyword]),
+    bulk: bulkSignals(email),
   };
 }
 

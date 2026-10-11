@@ -7,6 +7,8 @@
  * session while building this gatekeeper.
  */
 
+import type { BulkHeaders } from "./bulk";
+
 export const JMAP_CORE_CAPABILITY = "urn:ietf:params:jmap:core";
 export const JMAP_MAIL_CAPABILITY = "urn:ietf:params:jmap:mail";
 export const JMAP_SUBMISSION_CAPABILITY = "urn:ietf:params:jmap:submission";
@@ -50,7 +52,7 @@ export type JmapAttachment = {
 };
 
 /** One JMAP Email object (`Email/get`), narrowed to the properties this gatekeeper requests. */
-export type JmapEmailObject = {
+export type JmapEmailObject = BulkHeaders & {
   id: string;
   threadId: string;
   mailboxIds: Record<string, boolean>;

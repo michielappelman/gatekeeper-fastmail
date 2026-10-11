@@ -6,6 +6,7 @@
  * Every function here throws `FastmailError`, never a raw `Response` or JMAP method-error object.
  */
 
+import { BULK_HEADER_PROPERTIES, type BulkHeaders } from "./bulk";
 import { errorForStatus, FastmailError } from "./errors";
 import { escapeHtml } from "@gadgets/gatekeeper-kit/connect-pages";
 import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
@@ -179,9 +180,11 @@ export async function listMailboxes(
 // ---------------------------------------------------------------------------
 // Threads / messages
 
-const THREAD_ENTRY_PROPERTIES = ["id", "threadId", "subject", "from", "receivedAt", "preview", "keywords"];
+const THREAD_ENTRY_PROPERTIES = [
+  "id", "threadId", "subject", "from", "receivedAt", "preview", "keywords", ...BULK_HEADER_PROPERTIES,
+];
 
-export type RawThreadEntry = {
+export type RawThreadEntry = BulkHeaders & {
   id: string;
   threadId: string;
   subject: string | null;
@@ -313,7 +316,7 @@ export async function getThreadMetadata(
 
 const MESSAGE_PROPERTIES = [
   "id", "threadId", "mailboxIds", "keywords", "from", "to", "cc", "subject", "receivedAt", "sentAt", "preview",
-  "textBody", "htmlBody", "bodyValues", "attachments",
+  "textBody", "htmlBody", "bodyValues", "attachments", ...BULK_HEADER_PROPERTIES,
 ];
 
 export async function getMessages(

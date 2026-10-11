@@ -147,6 +147,18 @@ the full plain-text body, and the HTML body, including the one derived from the 
 agent gave none. Such a description is marked complete. A thread change lists the messages it
 touches (date, sender, subject) and the target folder or keyword.
 
+## Bulk-mail signals
+
+Every `FastmailMessage` (from `read()`, `thread.messages()` or a hook) and every
+`FastmailMessageEntry` (from `listMessages()`/`searchMessages()`) carries `bulk`
+(`FastmailBulkSignals`): the List-Id, List-Unsubscribe URLs and one-click support (RFC 8058),
+Precedence and Auto-Submitted headers, and `isBulk`, true for a List-Id, a List-Unsubscribe, or
+Precedence bulk/list/junk. They come from header properties Fastmail parses in the same
+`Email/get` (`header:List-Id:asText`, `header:List-Unsubscribe:asURLs`, …, RFC 8621 §4.1.2), so
+they cost no extra request. Auto-Submitted is reported separately: it marks automated mail (a
+notification, an out-of-office reply), not bulk mail. The headers are the sender's, so a missing
+marker proves nothing; unsubscribe URLs are never opened by the gatekeeper.
+
 ## Drafts and sending
 
 Drafts give the agent a way to prepare mail without sending it. `createDraft()` and

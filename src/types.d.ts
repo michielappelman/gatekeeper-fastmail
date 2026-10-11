@@ -66,6 +66,27 @@ export type FastmailMarkdownContent = {
   sourceMimeType: string;
 };
 
+/**
+ * Whether a message is mailing-list or bulk mail, from its headers. These are set by the sender, so
+ * a missing marker proves nothing: plenty of automated mail has none.
+ */
+export type FastmailBulkSignals = {
+  /** True when the message carries a List-Id, a List-Unsubscribe, or Precedence bulk/list/junk. */
+  isBulk: boolean;
+  /** The List-Id, without its description or angle brackets, e.g. `"news.example.com"`. */
+  listId?: string;
+  /** The List-Unsubscribe targets (`mailto:` or `https:` URLs). They come from the sender: never
+   * open one without the user asking to unsubscribe. */
+  unsubscribe?: string[];
+  /** True when the sender supports one-click unsubscribe (RFC 8058). */
+  oneClickUnsubscribe?: boolean;
+  /** The Precedence header, lower-cased, e.g. `"bulk"` or `"list"`. */
+  precedence?: string;
+  /** The Auto-Submitted header when it isn't `"no"`, e.g. `"auto-generated"` (an automated
+   * notification) or `"auto-replied"` (an out-of-office reply). */
+  autoSubmitted?: string;
+};
+
 /** One message within a thread. */
 export type FastmailMessage = {
   id: string;
@@ -82,6 +103,8 @@ export type FastmailMessage = {
   /** JMAP keywords on this message, e.g. `"$seen"`, `"$flagged"`, `"$answered"`, or a custom label
    * you or another mail client applied. */
   keywords: string[];
+  /** Whether it is mailing-list or bulk mail, from its headers. */
+  bulk: FastmailBulkSignals;
 };
 
 /**
@@ -166,6 +189,8 @@ export type FastmailMessageEntry<Ref = FastmailMessageRef> = {
   snippet: string;
   /** JMAP keywords on this message, e.g. `"$seen"`, `"$flagged"`. */
   keywords: string[];
+  /** Whether it is mailing-list or bulk mail, from its headers. */
+  bulk: FastmailBulkSignals;
   /** Opens this message: the same capability `getMessage(id)` returns. */
   ref: Ref;
 };
