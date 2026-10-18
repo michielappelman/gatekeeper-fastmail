@@ -287,21 +287,30 @@ export interface FastmailMessageHook<Thread = FastmailThread, Ref = FastmailMess
 
 /**
  * A draft in the connected account's Drafts folder: one created through this connection, or one
- * opened with `getDraft()` that was already there. The user can open, edit and send it from
- * Fastmail; edits made there are not reflected here, and the next change made here overwrites them.
+ * opened with `getDraft()` that was already there.
+ *
+ * `update()` and `delete()` are queued for the user's approval, but this object, `listDrafts()` and
+ * `getDraft()` show the change at once, before it is approved: a deleted draft reads as gone and
+ * an updated one shows its new content even while the change still waits. So reading it back does
+ * not tell you whether a change was approved or applied automatically. A rejected change falls back
+ * to the previous content. Changes to a draft the user wrote in Fastmail always wait for a person.
+ *
+ * Edits the user makes in Fastmail are not reflected here. For a draft the user wrote, such an
+ * edit makes further changes here fail with `RESOURCE_NOT_FOUND` (reopen it from `listDrafts()`);
+ * for one created through this connection, the next change made here overwrites them.
  */
 export interface FastmailDraft {
-  /** The draft's current addressees and subject. Throws `RESOURCE_NOT_FOUND` once it is deleted or
-   * sent. */
+  /** The draft's current addressees and subject, including changes still awaiting approval. Throws
+   * `RESOURCE_NOT_FOUND` once it is deleted (even if the deletion still waits) or sent. */
   getMetadata(): Promise<FastmailDraftInfo>;
 
-  /** The draft's plain-text and HTML bodies, as far as they have been written. */
+  /** The draft's plain-text and HTML bodies, including changes still awaiting approval. */
   getContent(): Promise<{ text?: string; html?: string }>;
 
-  /** Replaces the given fields, keeping the rest. A reply draft keeps its threading. */
+  /** Queues replacing the given fields, keeping the rest. A reply draft keeps its threading. */
   update(patch: FastmailDraftPatch): Promise<void>;
 
-  /** Discards the draft without sending it. */
+  /** Queues discarding the draft without sending it. */
   delete(): Promise<void>;
 }
 
