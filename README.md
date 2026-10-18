@@ -35,11 +35,21 @@ What a connection gets depends on two choices the user makes when connecting:
 ## Connecting an account
 
 1. In Fastmail, open [**Settings → Password & Security → API tokens**](https://app.fastmail.com/settings/security/tokens)
-   and create a token with **Mail** access. Add **Email submission** only if this connection should be
-   able to send, and **Contacts** if it should read or change contacts (a read-only Contacts token
-   can read them; approved changes then fail). App passwords (for IMAP, SMTP and POP)
-   do not work with JMAP.
-2. Paste the token into the gatekeeper's connect form.
+   and choose **New API token**. Set the options as follows:
+
+   |Option|Setting|Why|
+   |---|---|---|
+   |**Protocol**|**JMAP** (`https://api.fastmail.com/jmap/session`)|The gatekeeper speaks JMAP only; it does not use **MCP** or **Dynamic DNS**.|
+   |**Read-only access**|**Off**|Drafts, moves, flags, labels and approved changes all write. A read-only token can read, but every approved change then fails.|
+   |**Email**|**On** (required)|`urn:ietf:params:jmap:mail`: mailboxes, threads, messages, search.|
+   |**Email submission**|On to send; off for a draft-only connection|`urn:ietf:params:jmap:submission`. Without it the connection is draft-only: the agent prepares drafts and you send them from Fastmail. Requires **Email**.|
+   |**Contacts and contact groups**|On if the connection should use contacts|`urn:ietf:params:jmap:contacts`. Without it the contacts methods fail with `CONTACTS_NOT_AUTHORIZED`.|
+   |**Vacation response**|Off|Not used.|
+   |**Masked Email**|Off|Not used.|
+
+   Grant only what the connection needs: the token's scopes are the hard limit on what an agent can
+   do, enforced by Fastmail. App passwords (for IMAP, SMTP and POP) do not work with JMAP.
+2. Copy the token and paste it into the gatekeeper's connect form.
 3. Choose the binding scope in the configurator: whole mailbox, one folder, or a saved search.
 
 On connect, `UserAccount.completeConnection()` calls `GET https://api.fastmail.com/jmap/session`
