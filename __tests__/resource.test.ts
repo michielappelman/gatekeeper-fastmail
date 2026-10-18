@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { FastmailError } from "../src/errors";
-import { FASTMAIL_RESOURCE, parseResourceUrl, toResourceUrl } from "../src/resource";
+import { FASTMAIL_RESOURCE, normalizeSearch, parseResourceUrl, toResourceUrl } from "../src/resource";
 
 describe("resource", () => {
   it("round-trips the whole-mailbox resource URL", () => {
@@ -63,5 +63,48 @@ describe("resource", () => {
 
   it("rejects a malformed URL", () => {
     expect(() => parseResourceUrl("not a url")).toThrow(FastmailError);
+  });
+});
+
+describe("normalizeSearch", () => {
+  it("treats a string as a full-text search", () => {
+    expect(normalizeSearch(" wedding ")).toEqual({ text: "wedding" });
+  });
+
+  it("maps structured conditions to one JMAP FilterCondition", () => {
+    expect(normalizeSearch({
+      from: "shop@example.com", subject: "Invoice", unread: true, hasAttachment: true,
+      after: "2026-10-01", before: "2026-11-01T08:00:00Z",
+    })).toEqual({
+      from: "shop@example.com", subject: "Invoice", notKeyword: "$seen", hasAttachment: true,
+      after: "2026-10-01T00:00:00Z", before: "2026-11-01T08:00:00Z",
+    });
+    // Read and flagged both need hasKeyword, so they are ANDed.
+    expect(normalizeSearch({ unread: false, flagged: true })).toEqual({
+      operator: "AND", conditions: [{ hasKeyword: "$seen" }, { hasKeyword: "$flagged" }],
+    });
+    expect(normalizeSearch({ flagged: true })).toEqual({ hasKeyword: "$flagged" });
+  });
+
+  it("ANDs conditions that would collide on one key instead of overwriting one", () => {
+    // unread -> notKeyword $seen, flagged:false -> notKeyword $flagged, plus an explicit notKeyword.
+    expect(normalizeSearch({ unread: true, flagged: false, notKeyword: "$draft" })).toEqual({
+      operator: "AND",
+      conditions: [{ notKeyword: "$draft" }, { notKeyword: "$seen" }, { notKeyword: "$flagged" }],
+    });
+    expect(normalizeSearch({ unread: false, flagged: true, hasKeyword: "Work" })).toEqual({
+      operator: "AND", conditions: [{ hasKeyword: "Work" }, { hasKeyword: "$seen" }, { hasKeyword: "$flagged" }],
+    });
+    // The same condition twice is not a collision.
+    expect(normalizeSearch({ unread: true, notKeyword: "$seen" })).toEqual({ notKeyword: "$seen" });
+  });
+
+  it("refuses invalid searches", () => {
+    for (const search of [
+      "", "   ", {}, { text: "  " }, { evil: "x" }, { from: 1 }, { unread: "yes" }, { text: "x".repeat(257) },
+      { hasKeyword: "a*b" }, { after: "soon" }, { after: "2026-02-01", before: "2026-01-01" }, null, 7, [],
+    ]) {
+      expect(() => normalizeSearch(search), JSON.stringify(search)).toThrow(FastmailError);
+    }
   });
 });

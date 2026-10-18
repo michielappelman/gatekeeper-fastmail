@@ -8,7 +8,8 @@
  * outside it is refused exactly like a missing one.
  *
  * Changes are queued for approval and written by `applyAction()`. Creating, editing and membership
- * changes are auto-approvable; deleting never is.
+ * changes are auto-approvable; deleting never is. An edit is resolved against the card as it is when
+ * applied, and written per entry under `ifInState`, so concurrent edits are never overwritten.
  */
 
 import { DurableObject, RpcStub, RpcTarget } from "cloudflare:workers";
@@ -23,11 +24,14 @@ import type {
 } from "@gadgets/workshop-shared/gatekeeper";
 import { buildDescription, type RenderedDescription } from "@gadgets/gatekeeper-kit/action-description";
 import { OffsetCursor } from "@gadgets/gatekeeper-kit/cursors";
-import { cardProperties } from "./contact-input";
+import {
+  addressLine, cardProperties, onlineValue, organizationLine, planContactPatch, validateChanges,
+} from "./contact-input";
 import { FastmailError } from "./errors";
 import {
   findContactCardByUid,
   getContactCards,
+  getContactCardWithState,
   getContactGroup,
   getDefaultAddressBookId,
   listContactGroups,
@@ -46,6 +50,7 @@ import {
 import { outOfScope } from "./scope";
 import type {
   FastmailContact,
+  FastmailContactChanges,
   FastmailContactGroup,
   FastmailContactInput,
   FastmailContactsSession,
@@ -81,7 +86,8 @@ const AUTO_APPROVABLE_KINDS = {
 export type PendingContactAction =
   /** `uid` is minted at staging, so a retried apply finds the card a lost response created. */
   | { kind: "create"; uid: string; card: Record<string, unknown>; groupId?: string }
-  | { kind: "update"; id: string; patch: Record<string, unknown> }
+  /** The validated changes; entries are matched against the card when applied. */
+  | { kind: "update"; id: string; changes: FastmailContactChanges }
   | { kind: "delete"; id: string }
   | { kind: "membership"; id: string; groupId: string; add: boolean };
 
@@ -99,6 +105,13 @@ async function loadGroup(grant: ContactsGrant, groupId: string): Promise<JmapCon
 async function scopedCard(grant: ContactsGrant, scope: FastmailContactsScope, id: string): Promise<JmapContactCard> {
   if (!JMAP_ID.test(id)) throw outOfScope("That contact");
   const [found] = await getContactCards(grant.apiUrl, grant.apiToken, grant.accountId, [id]);
+  return admitCard(grant, scope, found);
+}
+
+/** `found` if it is a contact the scope admits now; otherwise not found, like a missing one. */
+async function admitCard(
+  grant: ContactsGrant, scope: FastmailContactsScope, found: JmapContactCard | undefined,
+): Promise<JmapContactCard> {
   if (!found || found.kind === "group") throw outOfScope("That contact");
   if (scope.kind === "group" && !(await loadGroup(grant, scope.groupId)).members?.[found.uid]) {
     throw outOfScope("That contact");
@@ -142,10 +155,7 @@ function toAgentContact(card: JmapContactCard): FastmailContact {
   const givenName = nameComponent(card, "given");
   const surname = nameComponent(card, "surname");
   const emails = byPreference(card.emails).map(email => ({ address: email.address, label: labelOf(email) }));
-  const organizations = Object.values(card.organizations ?? {}).flatMap(org => {
-    const parts = [org.name, ...(org.units ?? []).map(unit => unit.name)].filter((part): part is string => !!part);
-    return parts.length > 0 ? [parts.join(" / ")] : [];
-  });
+  const organizations = Object.values(card.organizations ?? {}).flatMap(org => organizationLine(org) ?? []);
   const name = card.name?.full ||
     card.name?.components?.filter(component => component.kind !== "separator").map(component => component.value)
       .join(" ") ||
@@ -166,16 +176,8 @@ function toAgentContact(card: JmapContactCard): FastmailContact {
     }),
     organizations,
     titles: Object.values(card.titles ?? {}).map(title => title.name),
-    addresses: Object.values(card.addresses ?? {}).flatMap(address => {
-      const line = address.full ||
-        (address.components ?? []).filter(component => component.kind !== "separator")
-          .map(component => component.value).join(", ");
-      return line ? [line] : [];
-    }),
-    online: Object.values(card.onlineServices ?? {}).flatMap(service => {
-      const value = service.uri ?? service.user;
-      return value ? [service.service && !service.uri ? `${service.service}: ${value}` : value] : [];
-    }),
+    addresses: Object.values(card.addresses ?? {}).flatMap(address => addressLine(address) ?? []),
+    online: Object.values(card.onlineServices ?? {}).flatMap(service => onlineValue(service) ?? []),
     ...birthday ? { birthday } : {},
     ...notes ? { notes } : {},
   };
@@ -452,7 +454,7 @@ export class FastmailContactsSessionImpl extends RpcTarget implements FastmailCo
   }
 
   async createContact(contact: FastmailContactInput, groupId?: string): Promise<void> {
-    const card = cardProperties(contact, { create: true });
+    const card = cardProperties(contact);
     const target = this.#groupFor(groupId);
     const group = target === undefined ? undefined : await this.#call(grant => loadGroup(grant, target));
     const uid = `urn:uuid:${crypto.randomUUID()}`;
@@ -465,19 +467,32 @@ export class FastmailContactsSessionImpl extends RpcTarget implements FastmailCo
       `Create Fastmail contact ${describeCard(card)}`, builder.finish(), AUTO_APPROVABLE_KINDS.contactCreate);
   }
 
-  async updateContact(id: string, changes: FastmailContactInput): Promise<void> {
-    const patch = cardProperties(changes, { create: false });
-    const current = toAgentContact(await this.#call(grant => scopedCard(grant, this.#scope, id)));
+  async updateContact(id: string, changes: FastmailContactChanges): Promise<void> {
+    const validated = validateChanges(changes);
+    const card = await this.#call(grant => scopedCard(grant, this.#scope, id));
+    const { missing } = planContactPatch(card, validated);
+    if (missing.length > 0) {
+      throw new FastmailError(
+        "INVALID_RESOURCE", `Nothing to remove: not on this contact (${missing.join("; ")}). Check getContact().`);
+    }
+    const name = toAgentContact(card).name;
     const builder = buildDescription(
-      `Change the Fastmail contact "${plainInline(current.name)}". Each property shown replaces the ` +
-      "contact's current one; null removes it.");
-    builder.json("Changes", patch);
+      `Change the Fastmail contact "${plainInline(name)}". Only the changes shown are made: entries to add ` +
+      "are appended, and entries to remove are matched against the contact as it is when this is " +
+      "approved. Everything else on the contact stays as it is.");
+    builder.json("Changes", validated);
     await this.#stage(
-      { kind: "update", id, patch }, `Edit Fastmail contact ${current.name}`, builder.finish(),
+      { kind: "update", id, changes: validated }, `Edit Fastmail contact ${name}`, builder.finish(),
       AUTO_APPROVABLE_KINDS.contactUpdate);
   }
 
   async deleteContact(id: string): Promise<void> {
+    // The group-bound type has no deleteContact(); this is the runtime guard behind that.
+    if (this.#scope.kind === "group") {
+      throw new FastmailError(
+        "INVALID_RESOURCE",
+        "A group binding can't delete contacts from the account; use removeFromGroup() to take one out of the group.");
+    }
     const current = toAgentContact(await this.#call(grant => scopedCard(grant, this.#scope, id)));
     const builder = buildDescription(
       `Delete the Fastmail contact "${plainInline(current.name)}" from this account, and with it from ` +
@@ -530,6 +545,9 @@ function describeCard(card: Record<string, unknown>): string {
   return toAgentContact({ id: "", uid: "", ...card } as JmapContactCard).name;
 }
 
+/** How often an edit is recomputed when the contacts change underneath it. */
+const MAX_UPDATE_ATTEMPTS = 3;
+
 /** Writes one approved change to Fastmail, re-checking the binding's scope first. */
 export async function applyContactAction(
   grant: ContactsGrant, scope: FastmailContactsScope, action: PendingContactAction,
@@ -537,23 +555,37 @@ export async function applyContactAction(
   const { apiUrl, apiToken, accountId } = grant;
   switch (action.kind) {
     case "create": {
+      // The group first: if it is gone this fails before a card exists outside it. Each step is
+      // skipped when already done, so a retry after either one completes the other.
       const group = action.groupId === undefined ? undefined : await loadGroup(grant, action.groupId);
-      const existing = await findContactCardByUid(apiUrl, apiToken, accountId, action.uid);
-      const addressBookId = existing ? undefined : await getDefaultAddressBookId(apiUrl, apiToken, accountId);
-      await setContactCards(apiUrl, apiToken, accountId, {
-        ...addressBookId ? {
+      if (group && !group.members?.[action.uid]) {
+        await setContactCards(apiUrl, apiToken, accountId, {
+          update: { [group.id]: { [`members/${action.uid}`]: true } },
+        });
+      }
+      if (!await findContactCardByUid(apiUrl, apiToken, accountId, action.uid)) {
+        const addressBookId = await getDefaultAddressBookId(apiUrl, apiToken, accountId);
+        await setContactCards(apiUrl, apiToken, accountId, {
           create: {
             c: { "@type": "Card", version: "1.0", ...action.card, uid: action.uid, addressBookIds: { [addressBookId]: true } },
           },
-        } : {},
-        ...group ? { update: { [group.id]: { [`members/${action.uid}`]: true } } } : {},
-      });
+        });
+      }
       return;
     }
     case "update":
-      await scopedCard(grant, scope, action.id);
-      await setContactCards(apiUrl, apiToken, accountId, { update: { [action.id]: action.patch } });
-      return;
+      // The card is read again on every attempt: a concurrent edit moves `state` and is merged in.
+      for (let attempt = 0; attempt < MAX_UPDATE_ATTEMPTS; attempt++) {
+        if (!JMAP_ID.test(action.id)) throw outOfScope("That contact");
+        const { card, state } = await getContactCardWithState(apiUrl, apiToken, accountId, action.id);
+        const current = await admitCard(grant, scope, card);
+        const { patch } = planContactPatch(current, action.changes);
+        if (Object.keys(patch).length === 0) return;
+        if (await setContactCards(apiUrl, apiToken, accountId, { update: { [action.id]: patch }, ifInState: state })) return;
+      }
+      throw new FastmailError(
+        "UPSTREAM_UNAVAILABLE",
+        "This contact kept changing while the edit was being applied. Approve the action again.");
     case "delete":
       await scopedCard(grant, scope, action.id);
       await setContactCards(apiUrl, apiToken, accountId, { destroy: [action.id] });

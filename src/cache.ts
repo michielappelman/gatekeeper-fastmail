@@ -170,6 +170,9 @@ export type DraftRecord = {
   answersEmailId?: string;
   /** For a forward draft: the email it forwards, marked `$forwarded` once the draft is sent. */
   forwardsEmailId?: string;
+  /** Set when the record was created by opening a Fastmail-native draft rather than by this connection:
+   * its changes are never auto-approved, and until one is applied its Email is tracked as the source. */
+  adopted?: true;
   /** Submitted revisions not yet approved or rejected, keyed by action id. */
   pending: Record<string, DraftRevision>;
   /** The newest revision applied to Fastmail, and the Email holding it while it is content. */

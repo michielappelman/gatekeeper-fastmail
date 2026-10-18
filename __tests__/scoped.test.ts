@@ -4,6 +4,10 @@ import { FastmailError } from "../src/errors";
 import { FastmailHookDeliveryImpl, FastmailSessionImpl } from "../src/fastmail";
 import type { FastmailScope } from "../src/resource";
 import { ScopeGuard } from "../src/scope";
+import { getDraftRecord, type CacheKv } from "../src/cache";
+import { applyDraftRevision, rejectDraftRevision } from "../src/drafts";
+import { updateEmails } from "../src/fastmail-api";
+import type { FastmailSearch, FastmailThreadChange } from "../src/types";
 
 type MethodCall = [string, Record<string, any>, string];
 type Handler = (args: Record<string, any>) => [string, Record<string, any>];
@@ -68,6 +72,7 @@ function mailbox(searchMatches: string[] = []) {
     "Email/query": args => ["Email/query", { ids: args.filter?.operator === "AND" && args.filter.conditions[1]?.operator === "OR"
       ? searchMatches : ["e1"] }],
     "Mailbox/get": () => ["Mailbox/get", { list: FOLDERS }],
+    "Email/set": () => ["Email/set", {}],
   });
 }
 
@@ -100,13 +105,23 @@ afterEach(() => {
 describe("ScopeGuard", () => {
   it("narrows listings to the scope", () => {
     expect(new ScopeGuard().listFilter({})).toBeUndefined();
-    expect(new ScopeGuard().listFilter({ inMailbox: "a", text: "x" })).toEqual({ inMailbox: "a", text: "x" });
+    expect(new ScopeGuard().listFilter({ inMailbox: "a", search: { text: "x" } })).toEqual({ inMailbox: "a", text: "x" });
     const folder = new ScopeGuard({ kind: "folder", folderId: "receipts" });
-    expect(folder.listFilter({ text: "x" })).toEqual({ inMailbox: "receipts", text: "x" });
+    expect(folder.listFilter({ search: { text: "x" } })).toEqual({ inMailbox: "receipts", text: "x" });
     expect(() => folder.listFilter({ inMailbox: "private" })).toThrow(FastmailError);
     const search = new ScopeGuard({ kind: "search", filter: { from: "shop@example.com" } });
-    expect(search.listFilter({ text: "x" })).toEqual({
+    expect(search.listFilter({ search: { text: "x" } })).toEqual({
       operator: "AND", conditions: [{ from: "shop@example.com" }, { text: "x" }],
+    });
+    // A caller's search that is itself an operator is ANDed in whole, never merged into a condition.
+    const either = { operator: "AND", conditions: [{ hasKeyword: "$seen" }, { hasKeyword: "$flagged" }] };
+    expect(folder.listFilter({ search: either })).toEqual({ operator: "AND", conditions: [{ inMailbox: "receipts" }, either] });
+    expect(new ScopeGuard().listFilter({ search: either })).toEqual(either);
+    expect(new ScopeGuard().listFilter({ inMailbox: "a", search: either })).toEqual({
+      operator: "AND", conditions: [{ inMailbox: "a" }, either],
+    });
+    expect(search.listFilter({ inMailbox: "a", search: either })).toEqual({
+      operator: "AND", conditions: [{ from: "shop@example.com" }, { inMailbox: "a" }, either],
     });
   });
 
@@ -267,7 +282,13 @@ describe("hook delivery on a search binding", () => {
   it("delivers only messages the search matches", async () => {
     const guard = new ScopeGuard({ kind: "search", filter: { subject: "Re:" } });
     const account = { getGrant: async () => GRANT, noteCredentialsExpired: async () => {} };
-    const impl = new FastmailHookDeliveryImpl(undefined, account as any, new Map() as any, {} as Ai, guard);
+    const store = new Map<string, unknown>();
+    const kv = {
+      get: (key: string) => store.get(key),
+      put: (key: string, value: unknown) => void store.set(key, value),
+      delete: (key: string) => store.delete(key),
+    };
+    const impl = new FastmailHookDeliveryImpl(undefined, account as any, kv as any, {} as Ai, guard);
     const received: any[] = [];
     const deliver = async (id: string) => {
       using queue = new RpcStub(new FakeApprovalQueue());
@@ -279,7 +300,279 @@ describe("hook delivery on a search binding", () => {
     expect(received).toEqual([]);
     await deliver("e2");
     expect(received).toHaveLength(1);
-    expect(received[0]).toMatchObject({ message: { id: "e2" }, folderId: null });
+    expect(received[0]).toMatchObject({ message: { id: "e2", folderIds: ["inbox"] }, folderId: null });
+  });
+});
+
+describe("structured search", () => {
+  const receipts: FastmailScope = { kind: "folder", folderId: "receipts" };
+
+  it("is ANDed with a folder binding's own folder, and a saved search's filter", async () => {
+    const folder = setup(receipts);
+    const jmap = mailbox();
+    await (await folder.session.searchThreads({ from: "shop@example.com", unread: true })).next();
+    expect(jmap.named("Email/query")[0].filter)
+      .toEqual({ inMailbox: "receipts", from: "shop@example.com", notKeyword: "$seen" });
+
+    // Colliding conditions keep the folder in an AND beside them.
+    await (await folder.session.searchMessages({ unread: true, notKeyword: "$draft" })).next();
+    // A cursor may load several pages per next(), so read the latest query, not a fixed index.
+    expect(jmap.named("Email/query").at(-1)!.filter).toEqual({
+      operator: "AND",
+      conditions: [{ inMailbox: "receipts" }, {
+        operator: "AND", conditions: [{ notKeyword: "$draft" }, { notKeyword: "$seen" }],
+      }],
+    });
+
+    const saved = setup({ kind: "search", filter: { subject: "Re:" } });
+    await (await saved.session.searchMessages({ flagged: true, unread: false }, "inbox")).next();
+    expect(jmap.named("Email/query").at(-1)!.filter).toEqual({
+      operator: "AND",
+      conditions: [{ subject: "Re:" }, { inMailbox: "inbox" }, {
+        operator: "AND", conditions: [{ hasKeyword: "$seen" }, { hasKeyword: "$flagged" }],
+      }],
+    });
+  });
+
+  it("keeps a string a full-text search, and refuses an invalid one before querying", async () => {
+    const { session } = setup({ kind: "mailbox" });
+    const jmap = mailbox();
+    await (await session.searchThreads("wedding", "inbox")).next();
+    expect(jmap.named("Email/query")[0].filter).toEqual({ inMailbox: "inbox", text: "wedding" });
+    // The fake keeps returning a row, so the walk above queried repeatedly; invalid searches add none.
+    const queried = jmap.named("Email/query").length;
+    await expect(session.searchThreads({})).rejects.toThrow(FastmailError);
+    await expect(session.searchMessages({ after: "yesterday" })).rejects.toThrow(FastmailError);
+    await expect(session.searchMessages({ evil: true } as unknown as FastmailSearch)).rejects.toThrow();
+    expect(jmap.named("Email/query")).toHaveLength(queried);
+  });
+});
+
+describe("folderIds on messages", () => {
+  const inSeveralFolders = { receipts: true, archive: true, private: true };
+
+  it("shows a folder binding only the folders it can see", async () => {
+    const { session } = setup({ kind: "folder", folderId: "receipts" });
+    mailbox();
+    EMAILS.e1.mailboxIds = inSeveralFolders;
+    try {
+      const entries = await (await session.listMessages()).next();
+      expect(entries?.[0].folderIds).toEqual(["receipts", "archive"]);
+      const messages = await (await session.getThread("t1")).messages();
+      expect(messages[0].folderIds).toEqual(["receipts", "archive"]);
+    } finally {
+      EMAILS.e1.mailboxIds = { receipts: true };
+    }
+  });
+
+  it("shows the whole mailbox every folder", async () => {
+    const { session } = setup({ kind: "mailbox" });
+    mailbox();
+    EMAILS.e1.mailboxIds = inSeveralFolders;
+    try {
+      const entries = await (await session.listMessages()).next();
+      expect(entries?.[0].folderIds).toEqual(["receipts", "archive", "private"]);
+    } finally {
+      EMAILS.e1.mailboxIds = { receipts: true };
+    }
+  });
+});
+
+type PendingPatch = { kind: "patch"; emailIds: string[]; patch: Record<string, unknown> };
+
+describe("updateThreads", () => {
+  it("queues one action over every message of the threads, with the single-thread kind and overlays", async () => {
+    const { session, queue, store } = setup({ kind: "mailbox" });
+    const jmap = mailbox();
+    await session.updateThreads(["t1", "t3", "t1"], { markRead: true });
+    expect(pending(store)).toEqual([{ kind: "patch", emailIds: ["e1", "e2", "e3"], patch: { "keywords/$seen": true } }]);
+    expect(queue.submitAction).toHaveBeenCalledTimes(1);
+    expect(queue.submitAction.mock.calls[0][1]).toMatchObject({
+      title: "Mark Fastmail threads read", actionKind: { tag: "readState" }, autoApprovable: true,
+    });
+    expect(JSON.stringify(queue.submitAction.mock.calls[0][1])).toContain("these 2 threads");
+    // The simulated read state shows on each message straight away.
+    expect(store.get("sim:keywords:e3")).toMatchObject({ keywords: { $seen: true } });
+    // The change is one Email/set over all of them when approved.
+    const [{ emailIds, patch }] = pending(store) as PendingPatch[];
+    await updateEmails("https://api/", "token", "u1", true, emailIds, patch);
+    expect(jmap.named("Email/set")).toHaveLength(1);
+    expect(Object.keys(jmap.named("Email/set")[0].update)).toEqual(["e1", "e2", "e3"]);
+  });
+
+  it("moves, flags and unflags like the single-thread methods", async () => {
+    const { session, queue, store } = setup({ kind: "mailbox" });
+    mailbox();
+    await session.updateThreads(["t3"], { moveToFolder: "archive" });
+    await session.updateThreads(["t3"], { addKeyword: "$flagged" });
+    await session.updateThreads(["t3"], { removeKeyword: "$flagged" });
+    await session.updateThreads(["t3"], { markUnread: true });
+    expect(pending(store)).toEqual([
+      { kind: "patch", emailIds: ["e3"], patch: { mailboxIds: { archive: true } } },
+      { kind: "patch", emailIds: ["e3"], patch: { "keywords/$flagged": true } },
+      { kind: "patch", emailIds: ["e3"], patch: { "keywords/$flagged": null } },
+      { kind: "patch", emailIds: ["e3"], patch: { "keywords/$seen": null } },
+    ]);
+    expect(queue.submitAction.mock.calls.map(call => call[1])).toEqual([
+      expect.objectContaining({ actionKind: expect.objectContaining({ tag: "move" }), autoApprovable: true }),
+      expect.objectContaining({ actionKind: expect.objectContaining({ tag: "keyword" }) }),
+      expect.objectContaining({ actionKind: expect.objectContaining({ tag: "keyword" }) }),
+      expect.objectContaining({ actionKind: expect.objectContaining({ tag: "readState" }) }),
+    ]);
+  });
+
+  it("changes only the in-scope messages, and refuses an out-of-scope or missing thread before queueing", async () => {
+    const { session, queue, store } = setup({ kind: "folder", folderId: "receipts" });
+    fakeJmap({
+      "Thread/get": args => ["Thread/get", {
+        list: (args.ids as string[]).flatMap(id =>
+          id === "t1" ? [{ id, emailIds: ["e1", "e2"] }] : id === "t3" ? [{ id, emailIds: ["e3"] }] : []),
+      }],
+      "Email/get": args => ["Email/get", { list: (args.ids as string[]).flatMap(id => EMAILS[id] ? [EMAILS[id]] : []) }],
+      "Mailbox/get": () => ["Mailbox/get", { list: FOLDERS }],
+    });
+    await session.updateThreads(["t1"], { markRead: true });
+    expect(pending(store)).toEqual([{ kind: "patch", emailIds: ["e1"], patch: { "keywords/$seen": true } }]);
+    expect(queue.submitAction).toHaveBeenCalledTimes(1);
+
+    const outside = await session.updateThreads(["t1", "t3"], { markRead: true }).catch((error: Error) => error.message);
+    const missing = await session.updateThreads(["t1", "t404"], { markRead: true }).catch((error: Error) => error.message);
+    expect(outside).toMatch(/not found/);
+    expect(outside).toBe(missing);
+    await expect(session.updateThreads(["t1"], { moveToFolder: "private" })).rejects.toThrow(/not found/);
+    expect(queue.submitAction).toHaveBeenCalledTimes(1);
+    expect(pending(store)).toHaveLength(1);
+  });
+
+  it("takes 1 to 500 thread ids and exactly one valid change", async () => {
+    const { session, queue } = setup({ kind: "mailbox" });
+    mailbox();
+    await expect(session.updateThreads([], { markRead: true })).rejects.toThrow(FastmailError);
+    await expect(session.updateThreads(Array.from({ length: 501 }, (_, i) => `t${i}`), { markRead: true }))
+      .rejects.toThrow(FastmailError);
+    // Malformed changes are turned away by the RPC argument validation, which throws synchronously.
+    await expect(async () => session.updateThreads(
+      ["t1"], { markRead: true, markUnread: true } as unknown as FastmailThreadChange)).rejects.toThrow();
+    await expect(async () => session.updateThreads(
+      ["t1"], { markRead: false } as unknown as FastmailThreadChange)).rejects.toThrow();
+    await expect(session.updateThreads(["../t1"], { markRead: true })).rejects.toThrow(/not found/);
+    expect(queue.submitAction).not.toHaveBeenCalled();
+  });
+});
+
+describe("drafts beyond this connection's", () => {
+  const NATIVE = {
+    id: "n1", mailboxIds: { drafts: true }, from: [{ email: "me@fastmail.com" }],
+    to: [{ email: "you@example.com", name: "You" }], cc: [], bcc: [{ email: "boss@example.com" }],
+    subject: "Native draft", receivedAt: "2026-10-05T10:00:00Z", inReplyTo: null, references: null,
+    attachments: [{ blobId: "b1", type: "application/pdf", name: "a.pdf", size: 10, disposition: "attachment" }],
+    textBody: [{ partId: "1", type: "text/plain" }], htmlBody: [{ partId: "2", type: "text/html" }],
+    bodyValues: { "1": { value: "Hello" }, "2": { value: "<p>Hello</p>" } },
+  };
+
+  function drafts() {
+    return fakeJmap({
+      "Mailbox/get": () => ["Mailbox/get", { list: [{ id: "drafts", role: "drafts" }] }],
+      "Email/query": () => ["Email/query", { ids: ["n1"] }],
+      "Email/get": args => ["Email/get", { list: (args.ids as string[]).includes("n1") ? [NATIVE] : [] }],
+      "Email/set": () => ["Email/set", { created: { draft: { id: "e100" } } }],
+    });
+  }
+
+  it("lists a Fastmail draft, adopts it on getDraft(), and edits it through the revision path", async () => {
+    const { session, queue, kv } = setup({ kind: "mailbox" });
+    const cacheKv = kv as unknown as CacheKv;
+    const jmap = drafts();
+    const listed = await session.listDrafts();
+    expect(listed).toEqual([expect.objectContaining({
+      id: "n1", subject: "Native draft", isReply: false, isForward: false,
+      to: [{ email: "you@example.com", name: "You" }], bcc: [{ email: "boss@example.com" }],
+      attachments: [{ filename: "a.pdf", mimeType: "application/pdf", size: 10 }],
+    })]);
+
+    const draft = await session.getDraft("n1");
+    const info = await draft.getMetadata();
+    expect(info.id).not.toBe("n1");
+    await expect(draft.getContent()).resolves.toEqual({ text: "Hello", html: "<p>Hello</p>" });
+    // Opened again by either id, it is the same draft, and no longer listed twice.
+    expect((await session.getDraft("n1").then(d => d.getMetadata())).id).toBe(info.id);
+    expect((await session.getDraft(info.id).then(d => d.getMetadata())).id).toBe(info.id);
+    expect((await session.listDrafts()).map(item => item.id)).toEqual([info.id]);
+
+    await draft.update({ subject: "Changed" });
+    expect(queue.submitAction.mock.calls[0][1]).not.toHaveProperty("actionKind");
+    expect(Object.keys(getDraftRecord(cacheKv, info.id)?.pending ?? {})).toEqual(["1"]);
+
+    // Approving replaces the Fastmail email: a new one is created and the adopted one destroyed.
+    await applyDraftRevision(cacheKv, 1, info.id, GRANT);
+    const [set] = jmap.named("Email/set");
+    expect(set.destroy).toEqual(["n1"]);
+    expect(set.create.draft).toMatchObject({
+      subject: "Changed", to: [{ email: "you@example.com", name: "You" }], bcc: [{ email: "boss@example.com" }],
+      bodyValues: { text: { value: "Hello" }, html: { value: "<p>Hello</p>" } },
+      attachments: [{ blobId: "b1", type: "application/pdf", name: "a.pdf", disposition: "attachment" }],
+    });
+    expect(getDraftRecord(cacheKv, info.id)?.applied).toMatchObject({ emailId: "e100" });
+  });
+
+  it("never auto-approves changes to an adopted draft, unlike one this connection created", async () => {
+    const { session, queue } = setup({ kind: "mailbox" });
+    drafts();
+    const adopted = await session.getDraft("n1");
+    await adopted.update({ subject: "Changed" });
+    await adopted.delete();
+    const created = await session.createDraft({ to: [{ email: "you@example.com" }], subject: "Mine", text: "Hi" });
+    await created.update({ subject: "Mine too" });
+    const [update, remove, , createdUpdate] = queue.submitAction.mock.calls.map(call => call[1]);
+    for (const submitted of [update, remove]) {
+      expect(submitted).not.toHaveProperty("actionKind");
+      expect(submitted).not.toHaveProperty("autoApprovable");
+    }
+    expect(createdUpdate).toMatchObject({ actionKind: { tag: "draftUpdate" }, autoApprovable: true });
+  });
+
+  it("drops an adopted draft whose Email was replaced in Fastmail, and refuses edits and applies against it", async () => {
+    const { session, queue, kv } = setup({ kind: "mailbox" });
+    const cacheKv = kv as unknown as CacheKv;
+    let present = ["n1"];
+    const NEWER = { ...NATIVE, id: "n2", subject: "Edited in Fastmail" };
+    fakeJmap({
+      "Mailbox/get": () => ["Mailbox/get", { list: [{ id: "drafts", role: "drafts" }] }],
+      "Email/query": () => ["Email/query", { ids: present }],
+      "Email/get": args => ["Email/get", {
+        list: [NATIVE, NEWER].filter(email => present.includes(email.id) && (args.ids as string[]).includes(email.id)),
+      }],
+      "Email/set": () => ["Email/set", { created: { draft: { id: "e100" } } }],
+    });
+    const draft = await session.getDraft("n1");
+    const { id } = await draft.getMetadata();
+    await draft.update({ subject: "Pending" });
+    queue.submitAction.mockClear();
+
+    // The person edits it in Fastmail: Fastmail replaces n1 with n2.
+    present = ["n2"];
+    await expect(draft.update({ subject: "Too late" })).rejects.toThrow(/changed or discarded in Fastmail/);
+    await expect(draft.delete()).rejects.toThrow(/changed or discarded in Fastmail/);
+    expect(queue.submitAction).not.toHaveBeenCalled();
+    await expect(applyDraftRevision(cacheKv, 1, id, GRANT)).rejects.toThrow(/changed or discarded in Fastmail/);
+
+    // Once nothing awaits approval, the stale record drops and the new Email surfaces natively.
+    rejectDraftRevision(cacheKv, 1, id);
+    expect((await session.listDrafts()).map(item => item.id)).toEqual(["n2"]);
+    expect(getDraftRecord(cacheKv, id)).toBeUndefined();
+    await expect(session.getDraft(id)).rejects.toThrow(/no longer exists/);
+    await expect(session.getDraft("n2").then(d => d.getMetadata())).resolves.toMatchObject({ subject: "Edited in Fastmail" });
+  });
+
+  it("doesn't adopt an email outside Drafts, or anything on a narrowed binding", async () => {
+    const whole = setup({ kind: "mailbox" });
+    drafts();
+    await expect(whole.session.getDraft("e1")).rejects.toThrow(/no longer exists/);
+    const scoped = setup({ kind: "folder", folderId: "receipts" });
+    const jmap = drafts();
+    await expect(scoped.session.listDrafts()).resolves.toEqual([]);
+    await expect(scoped.session.getDraft("n1")).rejects.toThrow(/no longer exists/);
+    expect(jmap.named("Email/query")).toHaveLength(0);
   });
 });
 

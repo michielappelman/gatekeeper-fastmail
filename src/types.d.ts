@@ -43,6 +43,56 @@ export type FastmailThreadEntry = {
   snippet: string;
 };
 
+/**
+ * Structured conditions for `searchThreads()` and `searchMessages()`: every condition given must
+ * match, and at least one is required. Text conditions match as Fastmail's own search does,
+ * case-insensitively, and are at most 256 characters.
+ *
+ * @example
+ * ```ts
+ * // Unread, flagged mail from a sender received in October 2026.
+ * const search: FastmailSearch = {
+ *   from: "shop@example.com", unread: true, flagged: true, after: "2026-10-01", before: "2026-11-01",
+ * };
+ * ```
+ */
+export type FastmailSearch = {
+  /** Full-text search over headers and body. */
+  text?: string;
+  /** Matches the sender's name or address. */
+  from?: string;
+  /** Matches a To recipient's name or address. */
+  to?: string;
+  subject?: string;
+  /** `true`: messages not yet read (no `"$seen"` keyword); `false`: messages already read. */
+  unread?: boolean;
+  /** `true`: messages with the `"$flagged"` keyword; `false`: messages without it. */
+  flagged?: boolean;
+  /** The message must carry this JMAP keyword, e.g. `"$answered"` or a custom label. */
+  hasKeyword?: string;
+  /** The message must not carry this JMAP keyword. */
+  notKeyword?: string;
+  /** `true`: messages with an attachment; `false`: messages without. */
+  hasAttachment?: boolean;
+  /** Received at or after this time: a date `YYYY-MM-DD` (UTC midnight) or a UTCDate such as `2026-10-01T08:00:00Z`. Must be before `before`, if both are given. */
+  after?: string;
+  /** Received before this time: a date `YYYY-MM-DD` (UTC midnight) or a UTCDate. */
+  before?: string;
+};
+
+/** What `updateThreads()` does to every message of the threads it is given. Exactly one change. */
+export type FastmailThreadChange =
+  /** Moves them into this folder (`FastmailFolder.id`), as `FastmailThread.moveToFolder()` does. */
+  | { moveToFolder: string }
+  /** Adds this JMAP keyword (e.g. `"$flagged"`, or a custom label). */
+  | { addKeyword: string }
+  /** Removes this JMAP keyword. */
+  | { removeKeyword: string }
+  /** Marks them read (adds `"$seen"`). */
+  | { markRead: true }
+  /** Marks them unread (removes `"$seen"`). */
+  | { markUnread: true };
+
 export type FastmailAddress = { email: string; name?: string };
 
 /** One attachment on a message. Pass `blobId` to `FastmailThread.readAttachment()`. */
@@ -103,6 +153,10 @@ export type FastmailMessage = {
   /** JMAP keywords on this message, e.g. `"$seen"`, `"$flagged"`, `"$answered"`, or a custom label
    * you or another mail client applied. */
   keywords: string[];
+  /** The folders this message is in (`FastmailFolder.id`), as `listFolders()` shows them: compare
+   * with a folder's `role` to tell where it is, e.g. archived (`"archive"`) or in the inbox. A
+   * connection limited to one folder or search lists only the folders it can see. */
+  folderIds: string[];
   /** Whether it is mailing-list or bulk mail, from its headers. */
   bulk: FastmailBulkSignals;
 };
@@ -159,7 +213,14 @@ export type FastmailDraftPatch = {
 
 /** A draft's current addressees and subject. */
 export type FastmailDraftInfo = {
-  /** Pass this to `getDraft()`. It stays the same when the draft is edited. */
+  /**
+   * Pass this to `getDraft()`. For a draft created through this connection, or one already opened
+   * with `getDraft()`, it is a stable id that stays the same when the draft is edited. For another
+   * draft in the Drafts folder it is that email's Fastmail id, which is a different kind of id: it
+   * is also what `getMessage()` takes, and changes when anyone edits the draft. Passing it to
+   * `getDraft()` takes the draft over under a stable id, and `listDrafts()` then shows that id
+   * instead.
+   */
   id: string;
   to: FastmailAddress[];
   cc: FastmailAddress[];
@@ -189,6 +250,10 @@ export type FastmailMessageEntry<Ref = FastmailMessageRef> = {
   snippet: string;
   /** JMAP keywords on this message, e.g. `"$seen"`, `"$flagged"`. */
   keywords: string[];
+  /** The folders this message is in (`FastmailFolder.id`), as `listFolders()` shows them: compare
+   * with a folder's `role` to tell where it is, e.g. archived (`"archive"`) or in the inbox. A
+   * connection limited to one folder or search lists only the folders it can see. */
+  folderIds: string[];
   /** Whether it is mailing-list or bulk mail, from its headers. */
   bulk: FastmailBulkSignals;
   /** Opens this message: the same capability `getMessage(id)` returns. */
@@ -221,8 +286,9 @@ export interface FastmailMessageHook<Thread = FastmailThread, Ref = FastmailMess
 }
 
 /**
- * A draft in the connected account's Drafts folder, created through this connection. The user can
- * open, edit and send it from Fastmail; edits made there are not reflected here.
+ * A draft in the connected account's Drafts folder: one created through this connection, or one
+ * opened with `getDraft()` that was already there. The user can open, edit and send it from
+ * Fastmail; edits made there are not reflected here, and the next change made here overwrites them.
  */
 export interface FastmailDraft {
   /** The draft's current addressees and subject. Throws `RESOURCE_NOT_FOUND` once it is deleted or
@@ -275,18 +341,40 @@ export interface FastmailDraftOnlySession {
   listThreads(folderId?: string): Promise<Cursor<FastmailThreadEntry>>;
 
   /**
-   * Full-text searches threads, newest first. Omit `folderId` to search the whole mailbox.
+   * Searches threads, newest first. A string is a full-text search; an object combines structured
+   * conditions (all must match). Omit `folderId` to search the whole mailbox.
    *
    * @example
    * ```ts
-   * const cursor = await session.searchThreads("wedding");
+   * // Unread mail from a sender in the last quarter, as threads.
+   * const cursor = await session.searchThreads(
+   *   { from: "shop@example.com", unread: true, after: "2026-07-01" });
    * const matches: FastmailThreadEntry[] = [];
    * for (let page = await cursor.next(); page !== null; page = await cursor.next()) {
    *   matches.push(...page);
    * }
+   *
+   * // Plain full-text search.
+   * await session.searchThreads("wedding");
    * ```
    */
-  searchThreads(query: string, folderId?: string): Promise<Cursor<FastmailThreadEntry>>;
+  searchThreads(query: string | FastmailSearch, folderId?: string): Promise<Cursor<FastmailThreadEntry>>;
+
+  /**
+   * Changes every message of several threads (from `FastmailThreadEntry.threadId`) with one queued
+   * action, one approval and one request to Fastmail: the equivalent of calling `moveToFolder()`,
+   * `addKeyword()`, `removeKeyword()`, `markRead()` or `markUnread()` on each thread, e.g. to
+   * archive a whole search result. 1 to 500 thread ids (repeats are ignored), at most 1000
+   * messages in all. If any id is not a thread this connection can reach, the call throws
+   * `RESOURCE_NOT_FOUND` and nothing is queued. Resolves when the change is queued.
+   *
+   * @example
+   * ```ts
+   * const archive = (await session.listFolders()).find(folder => folder.role === "archive")!;
+   * await session.updateThreads(entries.map(entry => entry.threadId), { moveToFolder: archive.id });
+   * ```
+   */
+  updateThreads(threadIds: string[], change: FastmailThreadChange): Promise<void>;
 
   /** Opens one thread by id (from a `FastmailThreadEntry.threadId`). */
   getThread(threadId: string): Promise<FastmailDraftOnlyThread>;
@@ -297,9 +385,9 @@ export interface FastmailDraftOnlySession {
    */
   listMessages(folderId?: string): Promise<Cursor<FastmailMessageEntry<FastmailDraftOnlyMessageRef>>>;
 
-  /** Full-text searches individual messages, newest first. Omit `folderId` to search the whole mailbox. */
+  /** Searches individual messages, newest first; see `FastmailSearch`. Omit `folderId` to search the whole mailbox. */
   searchMessages(
-    query: string, folderId?: string,
+    query: string | FastmailSearch, folderId?: string,
   ): Promise<Cursor<FastmailMessageEntry<FastmailDraftOnlyMessageRef>>>;
 
   /** Opens one message by id (from a `FastmailMessageEntry.id` or `FastmailMessage.id`). */
@@ -308,10 +396,25 @@ export interface FastmailDraftOnlySession {
   /** Creates a new draft in the Drafts folder. Nothing is sent. */
   createDraft(draft: FastmailDraftInput): Promise<FastmailDraft>;
 
-  /** Lists the drafts created through this connection that are still drafts, oldest first. */
+  /**
+   * Lists every draft in the account's Drafts folder: the drafts made through this connection
+   * (listed under their own stable ids), then the other drafts Fastmail holds, e.g. ones started in
+   * the Fastmail app or by another client (listed under their Fastmail email ids, which
+   * `getMessage()` also accepts). Each group is oldest first. Only the 100 newest emails in the
+   * Drafts folder are considered for the second group.
+   */
   listDrafts(): Promise<FastmailDraftInfo[]>;
 
-  /** Reopens a draft by its `FastmailDraftInfo.id`. */
+  /**
+   * Reopens a draft by its `FastmailDraftInfo.id`: either id kind from `listDrafts()` works. Opening
+   * a draft this connection doesn't hold yet (a Fastmail email id) takes over its current content,
+   * addressees, threading headers and attachments, and from then on the draft is held by this
+   * connection under a new stable id (`getMetadata().id`, and what `listDrafts()` shows instead of
+   * the email id). Changes to it are queued like any draft's: an edit replaces the Fastmail email,
+   * so the old email id stops working and edits you or the user made in Fastmail since opening it
+   * are overwritten by the next change. Throws `RESOURCE_NOT_FOUND` for an unknown id or one that
+   * isn't in the Drafts folder.
+   */
   getDraft(id: string): Promise<FastmailDraft>;
   /**
    * Have `hook.receiveMessage()` called with each new message that arrives in a folder: the inbox
@@ -368,7 +471,7 @@ export interface FastmailSession extends FastmailDraftOnlySession {
   /** Creates a new draft in the Drafts folder. Nothing is sent until you call its `send()`. */
   createDraft(draft: FastmailDraftInput): Promise<FastmailSendableDraft>;
 
-  /** Reopens a draft by its `FastmailDraftInfo.id`. */
+  /** Reopens a draft by its `FastmailDraftInfo.id`; see `FastmailDraftOnlySession.getDraft()`. */
   getDraft(id: string): Promise<FastmailSendableDraft>;
   /** Opens one message by id (from a `FastmailMessageEntry.id` or `FastmailMessage.id`). */
   getMessage(id: string): Promise<FastmailMessageRef>;
@@ -377,7 +480,7 @@ export interface FastmailSession extends FastmailDraftOnlySession {
   listMessages(folderId?: string): Promise<Cursor<FastmailMessageEntry>>;
 
   /** As `FastmailDraftOnlySession.searchMessages()`, with messages that can also be replied to. */
-  searchMessages(query: string, folderId?: string): Promise<Cursor<FastmailMessageEntry>>;
+  searchMessages(query: string | FastmailSearch, folderId?: string): Promise<Cursor<FastmailMessageEntry>>;
 
   /** As `FastmailDraftOnlySession.subscribeNewMessages()`, with a thread and message that can also reply. */
   subscribeNewMessages(
@@ -577,19 +680,28 @@ export interface FastmailScopedDraftOnlySession {
   listFolders(): Promise<FastmailFolder[]>;
   /** Lists threads in scope, newest first. `folderId` narrows a saved search to one folder. */
   listThreads(folderId?: string): Promise<Cursor<FastmailThreadEntry>>;
-  /** Full-text searches threads in scope, newest first. */
-  searchThreads(query: string, folderId?: string): Promise<Cursor<FastmailThreadEntry>>;
+  /** Searches threads in scope, newest first; a string is a full-text search, see `FastmailSearch`. */
+  searchThreads(query: string | FastmailSearch, folderId?: string): Promise<Cursor<FastmailThreadEntry>>;
   /** Opens one thread by id, showing only its messages in scope. */
   getThread(threadId: string): Promise<FastmailDraftOnlyThread>;
   /** Lists messages in scope, newest first. */
   listMessages(folderId?: string): Promise<Cursor<FastmailMessageEntry<FastmailDraftOnlyMessageRef>>>;
-  /** Full-text searches messages in scope, newest first. */
+  /** Searches messages in scope, newest first; see `FastmailSearch`. */
   searchMessages(
-    query: string, folderId?: string,
+    query: string | FastmailSearch, folderId?: string,
   ): Promise<Cursor<FastmailMessageEntry<FastmailDraftOnlyMessageRef>>>;
+  /**
+   * Changes every message of several threads in scope with one queued action. See
+   * `FastmailDraftOnlySession.updateThreads()`; a thread with no message in scope is refused like
+   * a missing one, and the change can only file mail into the folders `listFolders()` shows.
+   */
+  updateThreads(threadIds: string[], change: FastmailThreadChange): Promise<void>;
   /** Opens one message in scope by id. */
   getMessage(id: string): Promise<FastmailDraftOnlyMessageRef>;
-  /** Lists the drafts created through this connection that are still drafts, oldest first. */
+  /**
+   * Lists the drafts created through this connection that are still drafts, oldest first. Other
+   * drafts in the Drafts folder are outside this connection's scope and are not listed.
+   */
   listDrafts(): Promise<FastmailDraftInfo[]>;
   /** Reopens a draft by its `FastmailDraftInfo.id`. */
   getDraft(id: string): Promise<FastmailDraft>;
@@ -608,8 +720,8 @@ export interface FastmailScopedSession extends FastmailScopedDraftOnlySession {
   getThread(threadId: string): Promise<FastmailThread>;
   /** Lists messages in scope, newest first. */
   listMessages(folderId?: string): Promise<Cursor<FastmailMessageEntry>>;
-  /** Full-text searches messages in scope, newest first. */
-  searchMessages(query: string, folderId?: string): Promise<Cursor<FastmailMessageEntry>>;
+  /** As `FastmailScopedDraftOnlySession.searchMessages()`, with messages that can also be replied to. */
+  searchMessages(query: string | FastmailSearch, folderId?: string): Promise<Cursor<FastmailMessageEntry>>;
   /** Opens one message in scope by id. */
   getMessage(id: string): Promise<FastmailMessageRef>;
   /** Reopens a draft by its `FastmailDraftInfo.id`. */
@@ -669,12 +781,7 @@ export type FastmailContactGroup = {
   memberCount: number;
 };
 
-/**
- * A contact to create, or the fields of one to change. In `updateContact()` every field given
- * replaces that whole part of the card and fields left out stay as they are; `[]` or `null` clears
- * one. `name`, `givenName` and `surname` together form the card's name, so giving any of them
- * replaces the whole name with the ones given.
- */
+/** A contact to create with `createContact()`; change an existing one with `FastmailContactChanges`. */
 export type FastmailContactInput = {
   /** `"individual"` (a person, the default for a new contact) or `"org"` (an organization). */
   kind?: "individual" | "org";
@@ -696,8 +803,50 @@ export type FastmailContactInput = {
   /** Websites (`https://...`) or online-service handles. */
   online?: string[];
   /** `YYYY-MM-DD`, or `--MM-DD` when the year is unknown. */
+  birthday?: string;
+  notes?: string;
+};
+
+/** Entries to add to, and entries to remove from, one list of a contact. */
+export type FastmailContactListChange<Add, Remove = string> = {
+  /** Appended to the contact's entries; a value already there is not added again. */
+  add?: Add[];
+  /** Removes the matching entries. A value that isn't on the contact when you call is refused. */
+  remove?: Remove[];
+};
+
+/**
+ * Changes to one existing contact, for `updateContact()`. Only what you name changes: entries you
+ * don't remove stay exactly as they are, including details `FastmailContact` doesn't show.
+ * Removals are matched against the contact as it is when the change is approved, not when you ask,
+ * so edits made in between are kept and a value already gone is simply skipped.
+ */
+export type FastmailContactChanges = {
+  kind?: "individual" | "org";
+  /** The full display name; `null` removes it. */
+  name?: string | null;
+  /** Replaces the given-name part of the name (other parts such as a prefix stay); `null` removes it. */
+  givenName?: string | null;
+  /** As `givenName`, for the surname. */
+  surname?: string | null;
+  /** `YYYY-MM-DD`, or `--MM-DD` when the year is unknown; `null` removes it. */
   birthday?: string | null;
+  /** Replaces all notes with this one; `null` removes them. */
   notes?: string | null;
+  /** `remove` takes an address (case-insensitive). Labels as in `FastmailContactInput.emails`. */
+  emails?: FastmailContactListChange<FastmailContactEmail>;
+  /** `remove` takes a number; it matches by its digits and a leading `+`, ignoring spacing. */
+  phones?: FastmailContactListChange<FastmailContactPhone>;
+  /** `remove` takes the exact string `FastmailContact.nicknames` shows. */
+  nicknames?: FastmailContactListChange<string>;
+  /** `remove` takes the exact string `FastmailContact.organizations` shows, e.g. `"Acme / Research"`. */
+  organizations?: FastmailContactListChange<string>;
+  /** `remove` takes the exact string `FastmailContact.titles` shows. */
+  titles?: FastmailContactListChange<string>;
+  /** `remove` takes the exact line `FastmailContact.addresses` shows. */
+  addresses?: FastmailContactListChange<string>;
+  /** `remove` takes the exact string `FastmailContact.online` shows. */
+  online?: FastmailContactListChange<string>;
 };
 
 /**
@@ -722,8 +871,11 @@ export interface FastmailContactsSession {
   getContact(id: string): Promise<FastmailContact>;
   /** Queues creating a contact in the default address book, and adding it to `groupId` if given. */
   createContact(contact: FastmailContactInput, groupId?: string): Promise<void>;
-  /** Queues changing the given fields of a contact. */
-  updateContact(id: string, changes: FastmailContactInput): Promise<void>;
+  /**
+   * Queues changing a contact; entries are added and removed one by one, see `FastmailContactChanges`.
+   * Refused if a value to remove isn't on the contact.
+   */
+  updateContact(id: string, changes: FastmailContactChanges): Promise<void>;
   /** Queues deleting a contact from the account. Always needs a person's approval. */
   deleteContact(id: string): Promise<void>;
   /** Queues adding a contact to a group. */
@@ -735,7 +887,9 @@ export interface FastmailContactsSession {
 /**
  * Access to one contact group of a connected Fastmail account, chosen when this connection was
  * created. Only the group's current members are visible: a contact removed from the group leaves
- * scope too. Changes are queued for approval as for `FastmailContactsSession`.
+ * scope too. Changes are queued for approval as for `FastmailContactsSession`. There is no
+ * `deleteContact()`: deleting a contact from the account is outside a group connection's reach;
+ * `removeFromGroup()` takes a member out of the group.
  */
 export interface FastmailGroupContactsSession {
   /** This connection's group, with its current name and size. */
@@ -748,13 +902,11 @@ export interface FastmailGroupContactsSession {
   getContact(id: string): Promise<FastmailContact>;
   /** Queues creating a contact in the default address book as a member of this group. */
   createContact(contact: FastmailContactInput): Promise<void>;
-  /** Queues changing the given fields of one of the group's members. */
-  updateContact(id: string, changes: FastmailContactInput): Promise<void>;
   /**
-   * Queues deleting one of the group's members from the account entirely (not just from the group;
-   * use `removeFromGroup()` for that). Always needs a person's approval.
+   * Queues changing one of the group's members; entries are added and removed one by one, see
+   * `FastmailContactChanges`. Refused if a value to remove isn't on the contact.
    */
-  deleteContact(id: string): Promise<void>;
+  updateContact(id: string, changes: FastmailContactChanges): Promise<void>;
   /** Queues removing a member from this group; the contact itself stays in the account. */
   removeFromGroup(contactId: string): Promise<void>;
 }

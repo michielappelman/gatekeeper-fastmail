@@ -56,12 +56,14 @@ function formatBytes(size: number): string {
 export type MessageSummary = { from: string; subject: string; receivedAt: string };
 
 /**
- * The description of a change to a thread's messages (move, keyword, read state). `messages` is
- * what the gatekeeper could look up about them; when the lookup failed, only the count is known.
+ * The description of a change to the messages of one or several threads (move, keyword, read
+ * state). `messages` is what the gatekeeper could look up about them (it may be a sample of the
+ * `messageCount`); when the lookup failed, only the count is known. `where` names the threads, for
+ * the counts' wording.
  */
 export function describeThreadChange(
     intro: string, messageCount: number, messages: MessageSummary[] | undefined,
-    extra: { label: string; value: string }[] = []): RenderedDescription {
+    extra: { label: string; value: string }[] = [], where = "in this thread"): RenderedDescription {
   const builder = buildDescription(intro);
   for (const { label, value } of extra) builder.inline(label, value);
   if (messages?.length) {
@@ -69,10 +71,10 @@ export function describeThreadChange(
       .map(m => `${m.receivedAt.slice(0, 10)} · ${m.from} · ${m.subject}`);
     builder.list(`Messages (${messageCount})`, listed);
     if (messageCount > listed.length) {
-      builder.prose(`And ${messageCount - listed.length} more message(s) in this thread.`);
+      builder.prose(`And ${messageCount - listed.length} more message(s) ${where}.`);
     }
   } else {
-    builder.prose(`Applies to ${messageCount} message(s) in this thread.`);
+    builder.prose(`Applies to ${messageCount} message(s) ${where}.`);
   }
   return builder.finish();
 }

@@ -21,6 +21,7 @@
  */
 
 import type { SupportedResource } from "@gadgets/workshop-shared/gatekeeper";
+import type { JmapFilter } from "./fastmail-api";
 import { FastmailError } from "./errors";
 
 /** Host used for this gatekeeper's resource-identity URLs (the real JMAP API host). */
@@ -220,15 +221,9 @@ export function normalizeSearchFilter(input: unknown): FastmailSearchFilter {
     const value = raw.trim();
     if (!value) continue;
     if (SEARCH_TEXT_FIELDS.has(key)) {
-      if (value.length > MAX_SEARCH_TEXT) {
-        throw new FastmailError("INVALID_RESOURCE", `Fastmail search field "${key}" is too long.`);
-      }
-      filter[key as "from" | "to" | "subject" | "text"] = value;
+      filter[key as "from" | "to" | "subject" | "text"] = searchText(key, value);
     } else if (key === "hasKeyword") {
-      if (!JMAP_KEYWORD.test(value) || KEYWORD_FORBIDDEN.test(value)) {
-        throw new FastmailError("INVALID_RESOURCE", "Not a valid JMAP keyword.");
-      }
-      filter.hasKeyword = value;
+      filter.hasKeyword = searchKeyword(value);
     } else if (key === "folderId") {
       filter.folderId = validateFolderId(value);
     } else {
@@ -244,6 +239,22 @@ export function normalizeSearchFilter(input: unknown): FastmailSearchFilter {
   return filter;
 }
 
+/** A search text field, at most `MAX_SEARCH_TEXT` characters. */
+function searchText(field: string, value: string): string {
+  if (value.length > MAX_SEARCH_TEXT) {
+    throw new FastmailError("INVALID_RESOURCE", `Fastmail search field "${field}" is too long.`);
+  }
+  return value;
+}
+
+/** A JMAP keyword (RFC 8621 §4.1.1). */
+function searchKeyword(value: string): string {
+  if (!JMAP_KEYWORD.test(value) || KEYWORD_FORBIDDEN.test(value)) {
+    throw new FastmailError("INVALID_RESOURCE", "Not a valid JMAP keyword.");
+  }
+  return value;
+}
+
 /** A date (`YYYY-MM-DD`) or date-time, as a JMAP UTCDate. */
 function toUtcDate(value: string, field: string): string {
   const time = /^\d{4}-\d{2}-\d{2}$/.test(value) ? Date.parse(`${value}T00:00:00Z`) : Date.parse(value);
@@ -251,6 +262,87 @@ function toUtcDate(value: string, field: string): string {
     throw new FastmailError("INVALID_RESOURCE", `Fastmail search field "${field}" must be a date (YYYY-MM-DD).`);
   }
   return new Date(time).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+const AGENT_SEARCH_TEXT_FIELDS = ["text", "from", "to", "subject"] as const;
+const AGENT_SEARCH_BOOLEAN_FIELDS = ["unread", "flagged", "hasAttachment"] as const;
+const AGENT_SEARCH_FIELDS: readonly string[] = [
+  ...AGENT_SEARCH_TEXT_FIELDS, ...AGENT_SEARCH_BOOLEAN_FIELDS, "hasKeyword", "notKeyword", "after", "before",
+];
+
+/**
+ * Validates what an agent passed to `searchThreads()`/`searchMessages()` and returns the JMAP
+ * `Email/query` filter it stands for. A string is a full-text search; an object's fields must all
+ * match. Conditions that would share one `FilterCondition` key (e.g. `unread` and
+ * `notKeyword: "$seen"`) are ANDed in an operator instead of overwriting each other. At least one
+ * condition is required.
+ */
+export function normalizeSearch(input: unknown): JmapFilter {
+  const record: Record<string, unknown> = typeof input === "string" ? { text: input } : input as Record<string, unknown>;
+  if (typeof record !== "object" || record === null || Array.isArray(record)) {
+    throw new FastmailError("INVALID_RESOURCE", "A Fastmail search must be a string or an object.");
+  }
+  for (const key of Object.keys(record)) {
+    if (!AGENT_SEARCH_FIELDS.includes(key)) {
+      throw new FastmailError("INVALID_RESOURCE", `Unknown Fastmail search field "${key}".`);
+    }
+  }
+  const entries: [string, string | boolean][] = [];
+  for (const key of AGENT_SEARCH_TEXT_FIELDS) {
+    const raw = record[key];
+    if (raw === undefined || raw === null) continue;
+    if (typeof raw !== "string") {
+      throw new FastmailError("INVALID_RESOURCE", `Fastmail search field "${key}" must be a string.`);
+    }
+    const value = raw.trim();
+    if (value) entries.push([key, searchText(key, value)]);
+  }
+  for (const key of ["hasKeyword", "notKeyword"] as const) {
+    const raw = record[key];
+    if (raw === undefined || raw === null) continue;
+    if (typeof raw !== "string") {
+      throw new FastmailError("INVALID_RESOURCE", `Fastmail search field "${key}" must be a string.`);
+    }
+    entries.push([key, searchKeyword(raw.trim())]);
+  }
+  for (const key of ["after", "before"] as const) {
+    const raw = record[key];
+    if (raw === undefined || raw === null) continue;
+    if (typeof raw !== "string") {
+      throw new FastmailError("INVALID_RESOURCE", `Fastmail search field "${key}" must be a string.`);
+    }
+    entries.push([key, toUtcDate(raw.trim(), key)]);
+  }
+  for (const key of AGENT_SEARCH_BOOLEAN_FIELDS) {
+    const raw = record[key];
+    if (raw === undefined || raw === null) continue;
+    if (typeof raw !== "boolean") {
+      throw new FastmailError("INVALID_RESOURCE", `Fastmail search field "${key}" must be true or false.`);
+    }
+    if (key === "hasAttachment") entries.push(["hasAttachment", raw]);
+    else {
+      const keyword = key === "unread" ? "$seen" : "$flagged";
+      // Unread means not seen; flagged means has the flag.
+      const present = key === "unread" ? !raw : raw;
+      entries.push([present ? "hasKeyword" : "notKeyword", keyword]);
+    }
+  }
+  if (entries.length === 0) {
+    throw new FastmailError("INVALID_RESOURCE", "A Fastmail search needs at least one condition.");
+  }
+  const after = entries.find(([key]) => key === "after")?.[1];
+  const before = entries.find(([key]) => key === "before")?.[1];
+  if (typeof after === "string" && typeof before === "string" && after >= before) {
+    throw new FastmailError("INVALID_RESOURCE", "A Fastmail search's `after` must be before its `before`.");
+  }
+
+  const base: Record<string, unknown> = {};
+  const collisions: JmapFilter[] = [];
+  for (const [key, value] of entries) {
+    if (!(key in base)) base[key] = value;
+    else if (base[key] !== value) collisions.push({ [key]: value });
+  }
+  return collisions.length === 0 ? base : { operator: "AND", conditions: [base, ...collisions] };
 }
 
 /** The JMAP `FilterCondition` a search scope stands for (RFC 8621 §4.4.1). */

@@ -34,12 +34,16 @@ import {
   type TimedNonce,
 } from "@gadgets/gatekeeper-kit/connect-nonce";
 import { OffsetCursor } from "@gadgets/gatekeeper-kit/cursors";
-import { describeSend, describeThreadChange, formatAddress, type MessageSummary } from "./approval";
+import {
+  describeSend, describeThreadChange, formatAddress, MAX_LISTED_MESSAGES, type MessageSummary,
+} from "./approval";
 import type { RenderedDescription } from "@gadgets/gatekeeper-kit/action-description";
 import {
   clearSimulatedKeywordsIfLatest,
   currentDraftRevision,
   deletePendingAction,
+  deleteDraftRecord,
+  getDraftRecord,
   listDraftRecords,
   putDraftRecord,
   type DraftContent,
@@ -55,7 +59,10 @@ import {
   setPendingAction,
   setSimulatedKeywords,
 } from "./cache";
-import { applyDraftRevision, currentDraft, rejectDraftRevision, toDraftInfo } from "./drafts";
+import {
+  adoptedDraftRecord, adoptedSourceEmailId, applyDraftRevision, assertAdoptedSourceLive, currentDraft,
+  emailInDrafts, nativeDraftInfo, rejectDraftRevision, toDraftInfo,
+} from "./drafts";
 import { collectAttachmentGarbage, prepareAttachments, uploadAttachments } from "./attachments";
 import { bulkSignals } from "./bulk";
 import { FastmailError } from "./errors";
@@ -63,21 +70,26 @@ import { assertMarkdownConvertible, convertToMarkdown } from "./markdown";
 import {
   downloadBlob,
   fetchAccountInfo,
-  getAdmissionInfo,
-  getEmailHeaders,
-  queryMessagePage,
   fetchIdentityEmail,
+  findDraftsMailboxId,
+  getAdmissionInfo,
+  getDraftEmail,
+  getEmailHeaders,
   getMessages,
   getReplySource,
   getThreadMetadata,
-  replyRecipients,
+  getThreadsMetadata,
+  listDraftEmails,
   listMailboxes,
+  queryMessagePage,
   queryThreadPage,
+  replyRecipients,
   resolveSendContext,
   sendEmail,
   textToHtml,
   updateEmails,
   type FastmailAccountInfo,
+  type JmapFilter,
   type JmapReplySource,
   type RawThreadEntry,
   type SendEmailParams,
@@ -95,6 +107,7 @@ import {
   FASTMAIL_RESOURCE,
   isContactsResourceUrl,
   MAILBOX_SCOPE,
+  normalizeSearch,
   normalizeSearchFilter,
   parseContactsResourceUrl,
   parseResourceUrl,
@@ -116,6 +129,7 @@ import type {
   FastmailFolder,
   FastmailMarkdownContent,
   FastmailMessage,
+  FastmailSearch,
   FastmailMessageEntry,
   FastmailMessageRef,
   FastmailOutgoingAttachment,
@@ -123,6 +137,7 @@ import type {
   FastmailSession,
   FastmailThread,
   FastmailThreadEntry,
+  FastmailThreadChange,
 } from "./types";
 import TYPES_CODE from "./types.txt";
 import type {
@@ -707,8 +722,14 @@ function toThreadEntry(raw: RawThreadEntry, keywordOverlay: Record<string, boole
   };
 }
 
+/** The folders a message is in, from its JMAP `mailboxIds`; only those in `visible` when given. */
+function toFolderIds(mailboxIds: Record<string, boolean> | undefined, visible: Set<string> | undefined): string[] {
+  return Object.keys(mailboxIds ?? {}).filter(id => mailboxIds![id] && (!visible || visible.has(id)));
+}
+
 function toMessageEntry(
   raw: RawThreadEntry, keywordOverlay: Record<string, boolean> | undefined, ref: FastmailMessageRef,
+  visibleFolders: Set<string> | undefined,
 ): FastmailMessageEntry {
   const keywords = mergeSimulatedKeywords(raw.keywords, keywordOverlay);
   return {
@@ -720,6 +741,7 @@ function toMessageEntry(
     unread: !keywords["$seen"],
     snippet: raw.preview,
     keywords: Object.keys(keywords).filter(keyword => keywords[keyword]),
+    folderIds: toFolderIds(raw.mailboxIds, visibleFolders),
     bulk: bulkSignals(raw),
     ref,
   };
@@ -729,7 +751,9 @@ function toAgentAddresses(addresses: JmapEmailObject["from"] | null | undefined)
   return (addresses ?? []).map(address => ({ email: address.email, name: address.name ?? undefined }));
 }
 
-function toAgentMessage(email: JmapEmailObject, keywordOverlay: Record<string, boolean> | undefined): FastmailMessage {
+function toAgentMessage(
+  email: JmapEmailObject, keywordOverlay: Record<string, boolean> | undefined, visibleFolders: Set<string> | undefined,
+): FastmailMessage {
   const keywords = mergeSimulatedKeywords(email.keywords, keywordOverlay);
   const textPartId = email.textBody?.[0]?.partId;
   const htmlPartId = email.htmlBody?.[0]?.partId;
@@ -752,6 +776,7 @@ function toAgentMessage(email: JmapEmailObject, keywordOverlay: Record<string, b
     htmlBody: htmlPartId ? email.bodyValues?.[htmlPartId]?.value : undefined,
     attachments,
     keywords: Object.keys(keywords).filter(keyword => keywords[keyword]),
+    folderIds: toFolderIds(email.mailboxIds, visibleFolders),
     bulk: bulkSignals(email),
   };
 }
@@ -1277,6 +1302,11 @@ async function stageSend(
 // ---------------------------------------------------------------------------
 // SessionImpl — the RPC interface exposed to the Gadget
 
+/** `updateThreads()` takes at most this many threads, ... */
+const MAX_BULK_THREADS = 500;
+/** ... holding at most this many admitted messages, so one `Email/set` stays within a server's limits. */
+const MAX_BULK_MESSAGES = 1000;
+
 @validateRpc()
 export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
   #approvalQueue: RpcStub<ApprovalQueue>;
@@ -1344,7 +1374,7 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
     return this.#guard.visibleFolders(folders).map(toAgentFolder);
   }
 
-  #threadCursor(caller: { inMailbox?: string; text?: string }): Cursor<FastmailThreadEntry> {
+  #threadCursor(caller: { inMailbox?: string; search?: JmapFilter }): Cursor<FastmailThreadEntry> {
     // Before dup(): a folder outside the binding throws without leaking a stub.
     const filter = this.#guard.listFilter(caller);
     const approvalQueue = this.#approvalQueue.dup();
@@ -1373,8 +1403,9 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
     return this.#threadCursor(folderId ? { inMailbox: folderId } : {});
   }
 
-  async searchThreads(query: string, folderId?: string): Promise<Cursor<FastmailThreadEntry>> {
-    return this.#threadCursor(folderId ? { inMailbox: folderId, text: query } : { text: query });
+  async searchThreads(query: string | FastmailSearch, folderId?: string): Promise<Cursor<FastmailThreadEntry>> {
+    const search = normalizeSearch(query);
+    return this.#threadCursor(folderId ? { inMailbox: folderId, search } : { search });
   }
 
   async getThread(threadId: string): Promise<FastmailThread> {
@@ -1382,7 +1413,7 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
     return openThread(this.#ctx, grant, threadId);
   }
 
-  #messageCursor(caller: { inMailbox?: string; text?: string }): Cursor<FastmailMessageEntry> {
+  #messageCursor(caller: { inMailbox?: string; search?: JmapFilter }): Cursor<FastmailMessageEntry> {
     // Before dup(): a folder outside the binding throws without leaking a stub.
     const filter = this.#guard.listFilter(caller);
     const ctx = { ...this.#ctx, approvalQueue: this.#approvalQueue.dup() };
@@ -1394,9 +1425,10 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
         const grant = await ctx.account.getGrant();
         const raw = await call(() => queryMessagePage(
           grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, filter, offset, limit));
+        const visible = await visibleFolderIds(ctx, grant);
         return raw.map(entry => toMessageEntry(
           entry, getSimulatedKeywords(ctx.kv, entry.id),
-          new FastmailMessageRefImpl({ ...ctx, approvalQueue: ctx.approvalQueue.dup() }, entry.id)));
+          new FastmailMessageRefImpl({ ...ctx, approvalQueue: ctx.approvalQueue.dup() }, entry.id), visible));
       },
       authorizePage: (items, { terminal }) => ctx.approvalQueue.authorizeObservation({
         title: "List Fastmail messages",
@@ -1411,8 +1443,9 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
     return this.#messageCursor(folderId ? { inMailbox: folderId } : {});
   }
 
-  async searchMessages(query: string, folderId?: string): Promise<Cursor<FastmailMessageEntry>> {
-    return this.#messageCursor(folderId ? { inMailbox: folderId, text: query } : { text: query });
+  async searchMessages(query: string | FastmailSearch, folderId?: string): Promise<Cursor<FastmailMessageEntry>> {
+    const search = normalizeSearch(query);
+    return this.#messageCursor(folderId ? { inMailbox: folderId, search } : { search });
   }
 
   async getMessage(id: string): Promise<FastmailMessageRef> {
@@ -1467,23 +1500,148 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
   }
 
   async listDrafts(): Promise<FastmailDraftInfo[]> {
+    // A narrowed binding sees no other drafts: they are outside its scope.
+    const emails = this.#guard.restricted ? [] : await this.#listNativeDrafts();
     const drafts: FastmailDraftInfo[] = [];
-    for (const record of listDraftRecords(this.#kv)) {
+    const records = listDraftRecords(this.#kv);
+    for (const record of records) {
       const current = currentDraftRevision(record);
       if (current?.revision.kind === "content") {
         drafts.push(toDraftInfo(record, current.revision.content, current.revision.at));
       }
     }
+    const connectionDrafts = drafts.length;
+    // A draft this connection holds is listed once, under its own id.
+    const held = new Set(records.map(record => record.applied?.emailId));
+    for (const email of emails) {
+      if (!held.has(email.id)) drafts.push(nativeDraftInfo(email));
+    }
     await this.#approvalQueue.authorizeObservation({
       title: "List Fastmail drafts",
-      description: `Listed ${drafts.length} draft(s) created through this connection.`,
+      description: this.#guard.restricted
+        ? `Listed ${drafts.length} draft(s) created through this connection.`
+        : `Listed ${drafts.length} draft(s): ${connectionDrafts} held by this connection and ` +
+          `${drafts.length - connectionDrafts} other(s) in the Drafts folder.`,
     });
     return drafts;
   }
 
+  /** The Emails in Drafts, after dropping adopted records whose Email is no longer among them. */
+  async #listNativeDrafts() {
+    const grant = await this.#account.getGrant();
+    const emails = await this.#call(async () => listDraftEmails(
+      grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission,
+      await findDraftsMailboxId(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission)));
+    const listed = new Set(emails.map(email => email.id));
+    for (const record of listDraftRecords(this.#kv)) {
+      const sourceId = adoptedSourceEmailId(record);
+      // The listing is capped, so an Email missing from it is looked up before it is given up on.
+      if (sourceId !== undefined && !listed.has(sourceId)) await this.#dropIfStale(record, grant);
+    }
+    return emails;
+  }
+
   async getDraft(id: string): Promise<FastmailSendableDraft> {
-    currentDraft(this.#kv, id);
-    return new FastmailDraftImpl(this.#approvalQueue.dup(), this.#account, this.#kv, id, this.#guard);
+    const draftId = getDraftRecord(this.#kv, id) ? id : await this.#adoptNativeDraft(id) ?? id;
+    const record = getDraftRecord(this.#kv, draftId);
+    if (record && !this.#guard.restricted && adoptedSourceEmailId(record) !== undefined) {
+      await this.#dropIfStale(record, await this.#account.getGrant());
+    }
+    currentDraft(this.#kv, draftId);
+    return new FastmailDraftImpl(this.#approvalQueue.dup(), this.#account, this.#kv, draftId, this.#guard);
+  }
+
+  /**
+   * Drops an adopted record whose Email is gone from Drafts (the person edited or discarded it in
+   * Fastmail, which replaces the Email), so that what is there now surfaces natively instead. A
+   * record with a revision still awaiting approval is kept: applying it is refused as stale.
+   */
+  async #dropIfStale(record: DraftRecord, grant: StoredGrant): Promise<void> {
+    const sourceId = adoptedSourceEmailId(record);
+    if (sourceId === undefined || Object.keys(record.pending).length > 0) return;
+    if (!await this.#call(() => emailInDrafts(grant, sourceId))) deleteDraftRecord(this.#kv, record.id);
+  }
+
+  /**
+   * The id of the draft record holding the Email `emailId` in Drafts, creating the record (nothing
+   * is queued: it only mirrors what Fastmail holds) unless this connection already holds it.
+   * Undefined for anything else, as for a narrowed binding, which sees no draft it didn't create.
+   */
+  async #adoptNativeDraft(emailId: string): Promise<string | undefined> {
+    if (this.#guard.restricted || !/^[A-Za-z0-9_-]{1,255}$/.test(emailId)) return undefined;
+    const held = () => listDraftRecords(this.#kv).find(record => record.applied?.emailId === emailId);
+    if (held()) return held()!.id;
+    const grant = await this.#account.getGrant();
+    const email = await this.#call(async () => {
+      const draftsMailboxId =
+        await findDraftsMailboxId(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission);
+      const found = await getDraftEmail(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, emailId);
+      return found?.mailboxIds[draftsMailboxId] ? found : undefined;
+    });
+    if (!email) return undefined;
+    // Re-checked after the awaits: a concurrent getDraft() may have adopted it meanwhile.
+    if (held()) return held()!.id;
+    const record = adoptedDraftRecord(email, draftSender(grant));
+    putDraftRecord(this.#kv, record);
+    return record.id;
+  }
+
+  async updateThreads(threadIds: string[], change: FastmailThreadChange): Promise<void> {
+    let apply: (set: MessageSet) => Promise<void>;
+    if (typeof change !== "object" || change === null || Object.keys(change).length !== 1) {
+      throw new FastmailError("INVALID_RESOURCE", "updateThreads() takes exactly one change.");
+    } else if ("moveToFolder" in change && typeof change.moveToFolder === "string") {
+      apply = set => set.moveToFolder(change.moveToFolder);
+    } else if ("addKeyword" in change && typeof change.addKeyword === "string") {
+      apply = set => set.patchKeyword(change.addKeyword, true);
+    } else if ("removeKeyword" in change && typeof change.removeKeyword === "string") {
+      apply = set => set.patchKeyword(change.removeKeyword, false);
+    } else if ("markRead" in change && change.markRead === true) {
+      apply = set => set.patchKeyword("$seen", true);
+    } else if ("markUnread" in change && change.markUnread === true) {
+      apply = set => set.patchKeyword("$seen", false);
+    } else {
+      throw new FastmailError("INVALID_RESOURCE", "Not a valid FastmailThreadChange.");
+    }
+    if (!Array.isArray(threadIds) || threadIds.length === 0 || threadIds.length > MAX_BULK_THREADS) {
+      throw new FastmailError("INVALID_RESOURCE", `updateThreads() takes 1 to ${MAX_BULK_THREADS} thread ids.`);
+    }
+    const grant = await this.#account.getGrant();
+    const { ids, described, threadCount } = await this.#admitThreads(grant, threadIds);
+    await apply(new MessageSet(this.#ctx, ids, "threads", { threadCount, described }));
+  }
+
+  /**
+   * The messages of `threadIds` the scope admits, or a refusal, before anything is queued, if any
+   * thread is missing or has no admitted message: the same refusal for both.
+   */
+  async #admitThreads(
+    grant: StoredGrant, threadIds: string[],
+  ): Promise<{ ids: string[]; described: string[]; threadCount: number }> {
+    const unique = [...new Set(threadIds)];
+    if (unique.some(id => typeof id !== "string" || !/^[A-Za-z0-9_-]{1,255}$/.test(id))) {
+      throw outOfScope("That thread");
+    }
+    const threads = await this.#call(() => getThreadsMetadata(
+      grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, unique));
+    const all = unique.flatMap(threadId => threads.get(threadId) ?? []);
+    const admitted = new Set<string>();
+    for (let start = 0; start < all.length; start += 500) {
+      for (const id of await this.#call(() => this.#guard.admit(grant, all.slice(start, start + 500)))) {
+        admitted.add(id);
+      }
+    }
+    const perThread = unique.map(threadId => (threads.get(threadId) ?? []).filter(id => admitted.has(id)));
+    if (perThread.some(messageIds => messageIds.length === 0)) throw outOfScope("That thread");
+    const ids = perThread.flat();
+    if (ids.length > MAX_BULK_MESSAGES) {
+      throw new FastmailError(
+        "INVALID_RESOURCE", `Those threads hold more than ${MAX_BULK_MESSAGES} messages: change fewer threads at once.`);
+    }
+    // What the approver reads: each thread's newest message first, then more until the listing is full.
+    const newest = perThread.map(messageIds => messageIds[messageIds.length - 1]);
+    const described = [...new Set([...newest, ...ids])].slice(0, MAX_LISTED_MESSAGES);
+    return { ids, described, threadCount: unique.length };
   }
 
   async subscribeNewMessages(
@@ -1555,7 +1713,8 @@ export class FastmailHookDeliveryImpl extends RpcTarget implements FastmailHookD
       throw error;
     }
 
-    const message = toAgentMessage(email, getSimulatedKeywords(this.kv, email.id));
+    const visible = await visibleFolderIds({ account: this.account, kv: this.kv, guard: this.guard }, grant);
+    const message = toAgentMessage(email, getSimulatedKeywords(this.kv, email.id), visible);
     await approvalQueue.authorizeObservation({
       title: `New Fastmail message: ${message.subject}`.slice(0, 200),
       description: "Read a new message this hook watches for: its sender, recipients, " +
@@ -1597,13 +1756,43 @@ async function callFastmail<T>(account: DurableObjectStub<UserAccount>, fn: () =
   }
 }
 
+/** The folders this binding may name, cached like `listFolders()`. */
+async function bindingFolders(
+  ctx: Pick<CapabilityContext, "account" | "kv" | "guard">, grant: StoredGrant,
+): Promise<JmapMailboxObject[]> {
+  const now = Date.now();
+  let folders = getCachedFolders(ctx.kv, now);
+  if (!folders) {
+    folders = await callFastmail(ctx.account, () =>
+      listMailboxes(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission));
+    putCachedFolders(ctx.kv, folders, now);
+  }
+  return ctx.guard.visibleFolders(folders);
+}
+
+/** The ids of the folders a message may be reported in; undefined means every folder (the whole mailbox). */
+async function visibleFolderIds(
+  ctx: Pick<CapabilityContext, "account" | "kv" | "guard">, grant: StoredGrant,
+): Promise<Set<string> | undefined> {
+  if (!ctx.guard.restricted) return undefined;
+  return new Set((await bindingFolders(ctx, grant)).map(folder => folder.id));
+}
+
+/** What a change across several threads describes to the approver. */
+type BulkChange = {
+  threadCount: number;
+  /** The ids of the messages the approval lists, a sample of those it changes. */
+  described: string[];
+};
+
 class MessageSet {
   constructor(
     private readonly ctx: CapabilityContext,
     /** The ids this capability was opened with, already admitted at the time. */
     private readonly messageIds: string[],
-    /** "thread" or "message", for approval titles and descriptions. */
-    private readonly noun: "thread" | "message",
+    /** "thread", "message" or several "threads", for approval titles and descriptions. */
+    private readonly noun: "thread" | "message" | "threads",
+    private readonly bulk?: BulkChange,
   ) {}
 
   #call<T>(fn: () => Promise<T>): Promise<T> {
@@ -1613,7 +1802,7 @@ class MessageSet {
   /** The ids the scope still admits, refusing when none are left. */
   async admitted(grant: StoredGrant): Promise<string[]> {
     const ids = await this.#call(() => this.ctx.guard.admit(grant, this.messageIds));
-    if (ids.length === 0) throw outOfScope(this.noun === "thread" ? "That thread" : "That message");
+    if (ids.length === 0) throw outOfScope(this.noun === "message" ? "That message" : "That thread");
     return ids;
   }
 
@@ -1631,7 +1820,8 @@ class MessageSet {
         ? `Read ${emails.length} message(s) in this thread.`
         : "Read one message: its sender, recipients, date, subject, keywords, body, and attachments' names.",
     });
-    return emails.map(email => toAgentMessage(email, getSimulatedKeywords(this.ctx.kv, email.id)));
+    const visible = await visibleFolderIds(this.ctx, grant);
+    return emails.map(email => toAgentMessage(email, getSimulatedKeywords(this.ctx.kv, email.id), visible));
   }
 
   async reply(
@@ -1732,11 +1922,12 @@ class MessageSet {
   /**
    * Who sent which of the target messages, so the approver can tell what a change touches.
    * Best-effort: a failed lookup leaves the description with the message count only, rather than
-   * failing the action.
+   * failing the action. A change across several threads describes only `bulk.described` of them.
    */
   async #messageSummaries(grant: StoredGrant, ids: string[]): Promise<MessageSummary[] | undefined> {
+    const described = this.bulk ? ids.filter(id => this.bulk!.described.includes(id)) : ids;
     try {
-      const emails = await getMessages(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, ids);
+      const emails = await getMessages(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, described);
       return emails.map(email => ({
         from: email.from?.map(formatAddress).join(", ") || "(no sender)",
         subject: email.subject || "(no subject)",
@@ -1748,27 +1939,25 @@ class MessageSet {
     }
   }
 
-  /** The folders this binding may name, cached like `listFolders()`. */
-  async #visibleFolders(grant: StoredGrant): Promise<JmapMailboxObject[]> {
-    const now = Date.now();
-    let folders = getCachedFolders(this.ctx.kv, now);
-    if (!folders) {
-      folders = await this.#call(() =>
-        listMailboxes(grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission));
-      putCachedFolders(this.ctx.kv, folders, now);
+  /** What a change applies to, for approval text. */
+  get #target(): { phrase: string; where: string; title: string } {
+    switch (this.noun) {
+      case "thread":
+        return { phrase: "every message in this thread", where: "in this thread", title: "thread" };
+      case "message":
+        return { phrase: "this message", where: "in this thread", title: "message" };
+      case "threads": {
+        const count = this.bulk?.threadCount ?? 0;
+        return { phrase: `every message in these ${count} threads`, where: `in these ${count} threads`, title: "threads" };
+      }
     }
-    return this.ctx.guard.visibleFolders(folders);
-  }
-
-  #changeIntro(whole: string, single: string): string {
-    return this.noun === "thread" ? whole : single;
   }
 
   async moveToFolder(folderId: string): Promise<void> {
     const grant = await this.ctx.account.getGrant();
     let folderName: string;
     try {
-      const folder = (await this.#visibleFolders(grant)).find(candidate => candidate.id === folderId);
+      const folder = (await bindingFolders(this.ctx, grant)).find(candidate => candidate.id === folderId);
       // A narrowed binding may only file mail into the folders it can see (see ScopeGuard).
       if (!folder && this.ctx.guard.restricted) throw outOfScope("That folder");
       folderName = folder?.name ?? folderId;
@@ -1786,11 +1975,12 @@ class MessageSet {
     // Not cleaned up on a thrown error — see the matching comment in stageSend(): the overseer
     // commits the action record before submitAction() returns, so deleting the local record on a
     // failed await could orphan a genuinely-pending, still-approvable action.
+    const target = this.#target;
     await this.ctx.approvalQueue.submitAction(actionId, {
-      title: this.noun === "thread" ? "Move Fastmail thread" : "Move Fastmail message",
+      title: `Move Fastmail ${target.title}`,
       ...describeThreadChange(
-        this.#changeIntro("Move every message in this thread to another folder.", "Move this message to another folder."),
-        ids.length, summaries, [{ label: "To folder", value: folderName }]),
+        `Move ${target.phrase} to another folder.`,
+        ids.length, summaries, [{ label: "To folder", value: folderName }], target.where),
       implementsRevert: false,
       ...autoApprovable(AUTO_APPROVABLE_KINDS.move),
     });
@@ -1814,21 +2004,18 @@ class MessageSet {
     // submitAction() returns, so a failure reaching this await can mean the submission actually
     // succeeded server-side. Clearing either here could desync this session's view (or orphan a
     // still-approvable action) from what the overseer actually recorded.
-    const noun = this.noun === "thread" ? "thread" : "message";
+    const target = this.#target;
     const title = keyword === "$seen"
-      ? `Mark Fastmail ${noun} ${present ? "read" : "unread"}`
+      ? `Mark Fastmail ${target.title} ${present ? "read" : "unread"}`
       : present ? "Add Fastmail keyword" : "Remove Fastmail keyword";
     const intro = keyword === "$seen"
-      ? this.#changeIntro(
-        `Mark every message in this thread as ${present ? "read" : "unread"}.`,
-        `Mark this message as ${present ? "read" : "unread"}.`)
-      : this.#changeIntro(
-        `${present ? "Add a keyword to" : "Remove a keyword from"} every message in this thread.`,
-        `${present ? "Add a keyword to" : "Remove a keyword from"} this message.`);
+      ? `Mark ${target.phrase} as ${present ? "read" : "unread"}.`
+      : `${present ? "Add a keyword to" : "Remove a keyword from"} ${target.phrase}.`;
     await this.ctx.approvalQueue.submitAction(actionId, {
       title,
       ...describeThreadChange(
-        intro, ids.length, summaries, keyword === "$seen" ? [] : [{ label: "Keyword", value: keyword }]),
+        intro, ids.length, summaries, keyword === "$seen" ? [] : [{ label: "Keyword", value: keyword }],
+        target.where),
       implementsRevert: false,
       ...autoApprovable(keyword === "$seen" ? AUTO_APPROVABLE_KINDS.readState : AUTO_APPROVABLE_KINDS.keyword),
     });
@@ -2092,6 +2279,13 @@ export class FastmailDraftImpl extends RpcTarget implements FastmailSendableDraf
     return { approvalQueue: this.#approvalQueue, account: this.#account, kv: this.#kv, guard: this.#guard };
   }
 
+  /** Refuses a change to an adopted draft whose Fastmail original has since vanished. */
+  async #assertSourceLive(record: DraftRecord): Promise<void> {
+    if (adoptedSourceEmailId(record) === undefined) return;
+    const grant = await this.#account.getGrant();
+    await callFastmail(this.#account, () => assertAdoptedSourceLive(grant, record));
+  }
+
   async getMetadata(): Promise<FastmailDraftInfo> {
     const { record, content, at } = currentDraft(this.#kv, this.#draftId);
     await this.#approvalQueue.authorizeObservation({
@@ -2115,6 +2309,7 @@ export class FastmailDraftImpl extends RpcTarget implements FastmailSendableDraf
 
   async update(patch: FastmailDraftPatch): Promise<void> {
     const { record, content } = currentDraft(this.#kv, this.#draftId);
+    await this.#assertSourceLive(record);
     const next: DraftContent = { ...content };
     if (patch.to !== undefined) next.to = toJmapAddresses(patch.to) ?? [];
     if (patch.cc !== undefined) next.cc = toJmapAddresses(patch.cc);
@@ -2134,23 +2329,26 @@ export class FastmailDraftImpl extends RpcTarget implements FastmailSendableDraf
       describeSend(
         "Replace this draft in the Drafts folder with the content below. Nothing is sent.",
         { from: record.from, ...next }),
-      AUTO_APPROVABLE_KINDS.draftUpdate);
+      // An adopted draft was written by the person, not by this connection: they approve changes.
+      record.adopted ? undefined : AUTO_APPROVABLE_KINDS.draftUpdate);
   }
 
   async delete(): Promise<void> {
     const { record, content } = currentDraft(this.#kv, this.#draftId);
+    await this.#assertSourceLive(record);
     await stageDraftRevision(
       this.#context, record, { kind: "deleted", at: Date.now() }, "Discard email draft",
       describeSend(
         "Permanently discard this draft from the Drafts folder without sending it.",
         { from: record.from, ...content }),
-      AUTO_APPROVABLE_KINDS.draftDelete);
+      record.adopted ? undefined : AUTO_APPROVABLE_KINDS.draftDelete);
   }
 
   async send(): Promise<void> {
     const grant = await this.#account.getGrant();
     const from = requireSender(grant);
     const { record, content } = currentDraft(this.#kv, this.#draftId);
+    await this.#assertSourceLive(record);
     if (content.to.length === 0 && !content.cc?.length && !content.bcc?.length) {
       throw new FastmailError("INVALID_RESOURCE", "This draft has no recipients to send it to.");
     }

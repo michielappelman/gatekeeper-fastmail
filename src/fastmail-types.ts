@@ -63,6 +63,8 @@ export type JmapEmailObject = BulkHeaders & {
   from: JmapEmailAddress[] | null;
   to: JmapEmailAddress[] | null;
   cc: JmapEmailAddress[] | null;
+  /** Only when requested: a draft's Bcc. */
+  bcc?: JmapEmailAddress[] | null;
   subject: string | null;
   receivedAt: string;
   /** The `Date` header: when the sender says it was sent; only when requested. */

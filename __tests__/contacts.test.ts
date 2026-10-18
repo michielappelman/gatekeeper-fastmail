@@ -66,15 +66,20 @@ type SetArgs = {
   create?: Record<string, Record<string, unknown>>;
   update?: Record<string, Record<string, unknown>>;
   destroy?: string[];
+  ifInState?: string;
 };
 
 /**
  * A fake JMAP Contacts API over a copy of CARDS that returns ContactCard/get lists out of request
- * order and applies ContactCard/set to its copy, which it returns.
+ * order and applies ContactCard/set to its copy, which it returns. Like Fastmail it reports a
+ * `state`, advanced by every write, and refuses a set whose `ifInState` is stale with a
+ * `stateMismatch` error. `beforeSet` runs just before each set is evaluated, to play a concurrent
+ * writer; patches may address single map entries (`emails/k2`) and single properties (`name/full`).
  */
-function fakeContacts(): { cards: JmapContactCard[]; sets: SetArgs[] } {
+function fakeContacts() {
   const cards = structuredClone(CARDS);
   const sets: SetArgs[] = [];
+  const jmap = { cards, sets, state: 1, beforeSet: undefined as (() => void) | undefined };
   vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
     const { using, methodCalls } = JSON.parse(init.body as string) as {
       using: string[]; methodCalls: [string, MethodArgs & SetArgs, string][];
@@ -90,13 +95,18 @@ function fakeContacts(): { cards: JmapContactCard[]; sets: SetArgs[] } {
       }
       if (name === "ContactCard/get") {
         const ids = args["#ids"] ? queried[args["#ids"].resultOf] : args.ids ?? [];
-        return [name, { list: cards.filter(card => ids.includes(card.id)).toReversed() }, callId];
+        return [name, { state: String(jmap.state), list: cards.filter(card => ids.includes(card.id)).toReversed() }, callId];
       }
       if (name === "AddressBook/get") {
         return [name, { list: [{ id: "other" }, { id: "default", isDefault: true }] }, callId];
       }
       if (name === "ContactCard/set") {
         sets.push(args);
+        jmap.beforeSet?.();
+        if (args.ifInState !== undefined && args.ifInState !== String(jmap.state)) {
+          return ["error", { type: "stateMismatch" }, callId];
+        }
+        jmap.state++;
         const notUpdated: Record<string, { type: string }> = {};
         for (const [key, card] of Object.entries(args.create ?? {})) {
           cards.push({ ...card, id: `new-${key}` } as JmapContactCard);
@@ -122,7 +132,7 @@ function fakeContacts(): { cards: JmapContactCard[]; sets: SetArgs[] } {
     });
     return new Response(JSON.stringify({ methodResponses }));
   }));
-  return { cards, sets };
+  return jmap;
 }
 
 const GRANT = { apiUrl: "https://api/", apiToken: "token", accountId: "c-acct" };
@@ -295,17 +305,102 @@ describe("contact changes", () => {
     expect(jmap.cards.find(card => card.id === "g2")!.members).toEqual({ [created.uid]: true });
   });
 
-  it("patches only the fields given, and null clears one", async () => {
+  it("adds and removes single entries, leaving the others and their unknown properties intact", async () => {
     const jmap = fakeContacts();
+    const ada = jmap.cards.find(candidate => candidate.id === "c1")!;
+    // Details FastmailContact doesn't show: a structured address and an extra email property.
+    Object.assign(ada, { addresses: { a1: { full: "1 Analytical Way", components: [{ kind: "name", value: "1 Analytical Way" }], countryCode: "GB" } } });
+    Object.assign(ada.emails!.e1, { "@type": "EmailAddress", mediaType: "text/plain" });
+    const before = structuredClone(ada);
     const { session, queue, approve } = setup({ kind: "all" });
-    await session.updateContact("c1", { emails: [], notes: null, titles: ["Countess"] });
-    expect(queue.submitAction.mock.calls[0][1]).toMatchObject({ title: "Edit Fastmail contact Ada Lovelace" });
+    await session.updateContact("c1", {
+      emails: { add: [{ address: "ada@new.example", label: "work" }], remove: ["ADA@HOME.EXAMPLE"] },
+      notes: null, titles: { add: ["Countess"] },
+    });
+    expect(queue.submitAction.mock.calls[0][1]).toMatchObject({
+      title: "Edit Fastmail contact Ada Lovelace", actionKind: { tag: "contactUpdate" }, autoApprovable: true,
+    });
+    expect(jmap.sets).toHaveLength(0);
     await approve(queue.submitAction.mock.calls[0][0]);
+
+    const [{ update, ifInState }] = jmap.sets;
+    expect(ifInState).toBe("1");
+    expect(update!.c1).toEqual({
+      "emails/e2": null,
+      "emails/k1": { address: "ada@new.example", contexts: { work: true }, pref: 2 },
+      notes: null,
+      titles: { k1: { name: "Countess" } },
+    });
     const card = jmap.cards.find(candidate => candidate.id === "c1")!;
-    expect(card.emails).toBeUndefined();
+    expect(card.emails).toEqual({ e1: before.emails!.e1, k1: expect.objectContaining({ address: "ada@new.example" }) });
+    expect(card.addresses).toEqual(before.addresses);
     expect(card.notes).toBeUndefined();
     expect(card.titles).toEqual({ k1: { name: "Countess" } });
-    expect(card.name?.components).toHaveLength(2);
+    expect(card.name).toEqual(before.name);
+  });
+
+  it("changes a name part without losing the other components", async () => {
+    const jmap = fakeContacts();
+    const ada = jmap.cards.find(candidate => candidate.id === "c1")!;
+    ada.name = {
+      full: "Countess Ada Lovelace",
+      components: [{ kind: "prefix", value: "Countess" }, { kind: "given", value: "Ada" }, { kind: "surname", value: "Lovelace" }],
+    };
+    const { session, queue, approve } = setup({ kind: "all" });
+    await session.updateContact("c1", { givenName: "Augusta" });
+    await approve(queue.submitAction.mock.calls[0][0]);
+    expect(ada.name).toEqual({
+      full: "Countess Ada Lovelace",
+      components: [{ kind: "prefix", value: "Countess" }, { kind: "given", value: "Augusta" }, { kind: "surname", value: "Lovelace" }],
+    });
+    expect(Object.keys(jmap.sets[0].update!.c1)).toEqual(["name/components"]);
+  });
+
+  it("recomputes against a concurrent edit after a stateMismatch, and gives up after three", async () => {
+    const jmap = fakeContacts();
+    const { session, queue, approve } = setup({ kind: "all" });
+    await session.updateContact("c1", { phones: { add: [{ number: "+44 2" }], remove: ["+441"] } });
+    const [[actionId]] = queue.submitAction.mock.calls;
+
+    let racing = 1;
+    jmap.beforeSet = () => {
+      if (racing-- <= 0) return;
+      // Someone else adds a phone and the state moves on between the read and the write.
+      jmap.cards.find(candidate => candidate.id === "c1")!.phones!.other = { number: "+44 9" };
+      jmap.state++;
+    };
+    await approve(actionId);
+    expect(jmap.sets.map(set => set.ifInState)).toEqual(["1", "2"]);
+    expect(jmap.cards.find(candidate => candidate.id === "c1")!.phones).toEqual({
+      other: { number: "+44 9" }, k1: { number: "+44 2" },
+    });
+
+    // If the contacts never hold still, the edit fails instead of overwriting.
+    const stubborn = fakeContacts();
+    stubborn.beforeSet = () => { stubborn.state++; };
+    const second = setup({ kind: "all" });
+    await second.session.updateContact("c1", { titles: { add: ["Countess"] } });
+    await expect(second.approve(second.queue.submitAction.mock.calls[0][0])).rejects.toMatchObject({
+      code: "UPSTREAM_UNAVAILABLE",
+    });
+    expect(stubborn.sets).toHaveLength(3);
+  });
+
+  it("refuses removing what is not on the contact when staging, and skips it when applying", async () => {
+    const jmap = fakeContacts();
+    const { session, queue, approve } = setup({ kind: "all" });
+    await expect(session.updateContact("c1", { emails: { remove: ["nobody@example.com"] } })).rejects.toMatchObject({
+      code: "INVALID_RESOURCE", message: expect.stringContaining("nobody@example.com"),
+    });
+    expect(queue.submitAction).not.toHaveBeenCalled();
+
+    await session.updateContact("c1", { emails: { remove: ["ada@home.example"], add: [{ address: "ada@work.example" }] } });
+    // Someone removes it first: applying finds nothing to remove, and the add is already there.
+    const ada = jmap.cards.find(candidate => candidate.id === "c1")!;
+    delete ada.emails!.e2;
+    await approve(queue.submitAction.mock.calls[0][0]);
+    expect(jmap.sets).toHaveLength(0);
+    expect(Object.keys(ada.emails!)).toEqual(["e1"]);
   });
 
   it("never offers deletes for auto-approval", async () => {
@@ -332,19 +427,55 @@ describe("contact changes", () => {
     const jmap = fakeContacts();
     const { session, queue, approve } = setup({ kind: "group", groupId: "g1" });
     await expect(session.updateContact("c2", { name: "X" })).rejects.toMatchObject({ code: "RESOURCE_NOT_FOUND" });
-    await expect(session.deleteContact("c2")).rejects.toMatchObject({ code: "RESOURCE_NOT_FOUND" });
     await expect(session.removeFromGroup("c1", "g2")).rejects.toMatchObject({ code: "RESOURCE_NOT_FOUND" });
     await expect(session.addToGroup("c2", "g1")).rejects.toThrow(FastmailError);
     expect(queue.submitAction).not.toHaveBeenCalled();
 
-    await session.deleteContact("c1");
+    await session.updateContact("c1", { titles: { add: ["Countess"] } });
     await session.removeFromGroup("c1");
     // c1 leaves the group before either is approved: neither may touch it any more.
     delete jmap.cards.find(card => card.id === "g1")!.members!.u1;
     for (const [actionId] of queue.submitAction.mock.calls) {
       await expect(approve(actionId)).rejects.toMatchObject({ code: "RESOURCE_NOT_FOUND" });
     }
+    expect(jmap.sets).toHaveLength(0);
+  });
+
+  it("gives a group binding no deleteContact, and refuses it at runtime", async () => {
+    const jmap = fakeContacts();
+    const { session, queue } = setup({ kind: "group", groupId: "g1" });
+    await expect(session.deleteContact("c1")).rejects.toMatchObject({
+      code: "INVALID_RESOURCE", message: expect.stringContaining("removeFromGroup"),
+    });
+    expect(queue.submitAction).not.toHaveBeenCalled();
     expect(jmap.cards.map(card => card.id)).toContain("c1");
+  });
+
+  it("creates nothing when the group is gone before a group create is approved", async () => {
+    const jmap = fakeContacts();
+    const { session, queue, approve } = setup({ kind: "group", groupId: "g2" });
+    await session.createContact({ name: "New Friend" });
+    jmap.cards.splice(jmap.cards.findIndex(card => card.id === "g2"), 1);
+    await expect(approve(queue.submitAction.mock.calls[0][0])).rejects.toMatchObject({ code: "RESOURCE_NOT_FOUND" });
+    expect(jmap.sets).toHaveLength(0);
+    expect(jmap.cards.some(card => card.name?.full === "New Friend")).toBe(false);
+  });
+
+  it("adds the group member before creating the card, and a retry completes either step", async () => {
+    const jmap = fakeContacts();
+    const { session, queue, approve } = setup({ kind: "group", groupId: "g2" });
+    await session.createContact({ name: "New Friend" });
+    const [[actionId]] = queue.submitAction.mock.calls;
+    await approve(actionId);
+    expect(jmap.sets.map(set => Object.keys(set.update ?? set.create ?? {}))).toEqual([["g2"], ["c"]]);
+
+    // Lost response after the first step only: the member is there, the card is not yet.
+    const created = jmap.cards.find(card => card.id === "new-c")!;
+    jmap.cards.splice(jmap.cards.indexOf(created), 1);
+    jmap.sets.length = 0;
+    await approve(actionId);
+    expect(jmap.sets.map(set => Object.keys(set.update ?? set.create ?? {}))).toEqual([["c"]]);
+    expect(jmap.cards.filter(card => card.uid === created.uid)).toHaveLength(1);
   });
 
   it("rejects invalid input before queueing", async () => {
@@ -354,6 +485,8 @@ describe("contact changes", () => {
     await expect(session.createContact({ emails: [{ address: "not an address" }] })).rejects.toThrow(FastmailError);
     await expect(session.updateContact("c1", { birthday: "12/10" })).rejects.toThrow(FastmailError);
     await expect(session.updateContact("c1", {})).rejects.toThrow(FastmailError);
+    await expect(session.updateContact("c1", { emails: { add: [] } })).rejects.toThrow(FastmailError);
+    await expect(session.updateContact("c1", { emails: { add: [{ address: "bad" }] } })).rejects.toThrow(FastmailError);
     expect(queue.submitAction).not.toHaveBeenCalled();
   });
 });

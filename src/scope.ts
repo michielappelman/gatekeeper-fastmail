@@ -39,6 +39,20 @@ export function outOfScope(what: string): FastmailError {
  */
 const SCOPED_FILING_ROLES: ReadonlySet<string> = new Set(["inbox", "archive", "trash", "junk"]);
 
+/**
+ * Several conditions that must all hold: merged into one `FilterCondition` when none is an operator
+ * and no key repeats, otherwise an AND operator (a merge would overwrite a repeated key). No
+ * conditions means no filter.
+ */
+function conjunction(conditions: JmapFilter[]): JmapFilter | undefined {
+  if (conditions.length === 0) return undefined;
+  if (conditions.length === 1) return conditions[0];
+  const keys = conditions.flatMap(condition => Object.keys(condition));
+  return conditions.some(condition => "operator" in condition) || new Set(keys).size !== keys.length
+    ? { operator: "AND", conditions }
+    : Object.assign({}, ...conditions);
+}
+
 export class ScopeGuard {
   constructor(readonly scope: FastmailScope = MAILBOX_SCOPE) {}
 
@@ -55,19 +69,21 @@ export class ScopeGuard {
   }
 
   /**
-   * The `Email/query` filter for a listing or search the caller asked for, narrowed to the scope.
-   * A folder outside a folder binding is refused rather than silently ignored.
+   * The `Email/query` filter for a listing or search the caller asked for, narrowed to the scope:
+   * the caller's conditions are ANDed with the scope's, never replacing them. `search` is the
+   * caller's already-validated search (see `normalizeSearch()`). A folder outside a folder binding
+   * is refused rather than silently ignored.
    */
-  listFilter(caller: { inMailbox?: string; text?: string }): JmapFilter | undefined {
+  listFilter(caller: { inMailbox?: string; search?: JmapFilter }): JmapFilter | undefined {
     const callerConditions: JmapFilter[] = [];
     if (caller.inMailbox) callerConditions.push({ inMailbox: caller.inMailbox });
-    if (caller.text) callerConditions.push({ text: caller.text });
+    if (caller.search) callerConditions.push(caller.search);
     switch (this.scope.kind) {
       case "mailbox":
-        return callerConditions.length > 0 ? Object.assign({}, ...callerConditions) : undefined;
+        return conjunction(callerConditions);
       case "folder":
         if (caller.inMailbox && caller.inMailbox !== this.scope.folderId) throw outOfScope("That folder");
-        return { inMailbox: this.scope.folderId, ...caller.text ? { text: caller.text } : {} };
+        return conjunction([{ inMailbox: this.scope.folderId }, ...caller.search ? [caller.search] : []]);
       case "search":
         return { operator: "AND", conditions: [searchFilterCondition(this.scope.filter), ...callerConditions] };
     }

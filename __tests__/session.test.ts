@@ -26,7 +26,32 @@ const SENDING_GRANT = {
 };
 const DRAFT_ONLY_GRANT = { ...SENDING_GRANT, hasSubmission: false, identityEmail: undefined };
 
-function setup(grant: typeof SENDING_GRANT | typeof DRAFT_ONLY_GRANT = SENDING_GRANT) {
+/**
+ * Stubs `fetch` with a JMAP API whose Drafts folder is empty, as `listDrafts()` looks there;
+ * `emails` answers `Email/get`.
+ */
+function stubJmap(emails: (ids: string[]) => unknown[]) {
+  vi.stubGlobal("fetch", vi.fn(async (_url: string, init: RequestInit) => {
+    const { methodCalls } = JSON.parse(init.body as string) as {
+      methodCalls: [string, { ids?: string[] }, string][];
+    };
+    return new Response(JSON.stringify({
+      methodResponses: methodCalls.map(([name, args, id]) => [
+        name,
+        name === "Mailbox/get" ? { list: [{ id: "mb-drafts", role: "drafts" }] }
+          : name === "Email/query" ? { ids: [] }
+          : name === "Email/get" ? { list: emails(args.ids ?? []) }
+          : {},
+        id,
+      ]),
+    }));
+  }));
+}
+
+function setup(
+  grant: typeof SENDING_GRANT | typeof DRAFT_ONLY_GRANT = SENDING_GRANT, emails: (ids: string[]) => unknown[] = () => [],
+) {
+  stubJmap(emails);
   const queue = fakeApprovalQueue();
   const kv = makeKv();
   const account = { getGrant: async () => grant, noteCredentialsExpired: async () => {} };
@@ -125,14 +150,12 @@ describe("a token without Email submission", () => {
 
 describe("reply drafts", () => {
   it("addresses and threads a reply draft like reply()", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
-      methodResponses: [["Email/get", { list: [{
-        id: "e-orig", messageId: ["orig@x"], references: ["root@x"],
-        from: [{ email: "anna@example.com", name: "Anna" }], to: [{ email: "me@fastmail.com" }],
-        subject: "Dinner", receivedAt: "2026-10-01T10:00:00Z",
-      }] }, "c1"]],
-    }))));
-    const { session, thread, submitted } = setup(DRAFT_ONLY_GRANT);
+    const original = {
+      id: "e-orig", messageId: ["orig@x"], references: ["root@x"],
+      from: [{ email: "anna@example.com", name: "Anna" }], to: [{ email: "me@fastmail.com" }],
+      subject: "Dinner", receivedAt: "2026-10-01T10:00:00Z",
+    };
+    const { session, thread, submitted } = setup(DRAFT_ONLY_GRANT, ids => ids.includes("e-orig") ? [original] : []);
     const draft = await thread(["e-orig"]).createReplyDraft({ text: "Yes!" });
 
     expect(submitted()[0]).toMatchObject({ title: "Save reply draft", actionKind: { tag: "draftCreate" } });
@@ -148,9 +171,6 @@ describe("reply drafts", () => {
 
 describe("thread changes", () => {
   it("tags read state, keywords and moves with their own auto-approvable kinds", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({
-      methodResponses: [["Email/get", { list: [] }, "c1"]],
-    }))));
     const { thread, submitted } = setup();
     const t = thread(["e1"]);
     await t.markRead();

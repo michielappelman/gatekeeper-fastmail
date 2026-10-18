@@ -67,8 +67,9 @@ __tests__/             JMAP, resource, cache, and configurator tests
   re-reads the group's `members` on every listing and `getContact()`; a card outside it is refused
   exactly like a missing one, and group cards are never returned as contacts. Contact changes are
   queued for approval, and the scope is re-checked when they are applied. `deleteContact()` must
-  never carry an `actionKind`/`autoApprovable`; a group binding must never add existing contacts
-  to its group.
+  never carry an `actionKind`/`autoApprovable`, and a group binding must not have it at all (absent
+  from `FastmailGroupContactsSession`, refused at runtime); a group binding must never add existing
+  contacts to its group.
 - Resource parsing must reject foreign hosts, paths, query strings, malformed URLs, unknown hash
   forms, unknown search fields, and empty searches.
 - The binding's `ScopeGuard` (`src/scope.ts`) is the capability boundary. Every read and change goes
@@ -119,6 +120,17 @@ Important protocol details:
   first, and `OffsetCursor` pages of 25. Preserve the requested id order because `Email/get` does
   not guarantee response order.
 - Apply thread mutations with one `Email/set` patch to every message id in the thread.
+- `updateThreads()` resolves its threads with one `Thread/get`, admits the messages through
+  `ScopeGuard.admit()` in chunks of 500, and applies the pending patch as one `Email/set`. It caps
+  the admitted messages at 1000 (`MAX_BULK_MESSAGES`), an assumption about a server's
+  `maxObjectsInSet` that was not verified against Fastmail.
+- Agent searches (`string | FastmailSearch`) go through `normalizeSearch()` in `src/resource.ts`,
+  sharing its text, keyword and date validation with the saved-search scope, and become one
+  `FilterCondition`; conditions colliding on a key (`unread`/`flagged` vs `hasKeyword`/`notKeyword`)
+  are ANDed in an operator. `ScopeGuard.listFilter()` ANDs that with the scope: a plain condition
+  may merge into a folder's `{inMailbox}`, an operator never does.
+- Message and thread-message `folderIds` come from `mailboxIds`, filtered through
+  `ScopeGuard.visibleFolders()` for narrowed bindings so no other folder id leaks.
 - Convert upstream HTTP and method errors into stable `FastmailErrorCode` values. Session code
   should not branch on raw response bodies or JMAP error strings.
 - Contacts use JMAP Core + Contacts (RFC 9610) against `primaryAccounts[urn:ietf:params:jmap:contacts]`.
@@ -126,9 +138,17 @@ Important protocol details:
   `{uid}` conditions. Never put a `kind` condition inside a filter operator: Fastmail hoists it onto
   the operator (seen live: `NOT {kind: "group"}` matches nothing), so contact listings drop group
   cards client-side through `OffsetCursor`'s `retain`, which keeps paging by the raw page.
-- Contact changes are one `ContactCard/set`. A creation carries a `uid` minted when it was queued,
-  so a retried apply looks the card up by `uid` instead of creating it twice, and goes into the
-  default `AddressBook`.
+- A creation carries a `uid` minted when it was queued, so a retried apply looks the card up by
+  `uid` instead of creating it twice, and goes into the default `AddressBook`. In a group it is
+  two `ContactCard/set`s, in this order: add the `uid` to the group's `members` (fails if the group
+  is gone, so nothing is created), then create the card; each is skipped when already done.
+- An edit is never stored as a patch. `updateContact()` stores the validated
+  `FastmailContactChanges`; `applyContactAction` reads the card and `state` at apply time, plans
+  per-key paths with `planContactPatch()` (`emails/<key>`, `name/components`, ...; whole-property
+  replacement would lose concurrent edits and properties `FastmailContact` doesn't show) and sends
+  `ContactCard/set` with `ifInState`, recomputing on `stateMismatch` up to 3 attempts. Removals
+  already satisfied are no-ops; at staging a removal that matches nothing is `INVALID_RESOURCE`.
+  Keep the match rules in `contact-input.ts` in step with how `toAgentContact` shows each value.
 
 When changing protocol code, update `__tests__/fastmail-client.test.ts` (mail) or
 `__tests__/contacts.test.ts` (contacts; its fake reproduces Fastmail's `kind` quirk) and keep the
@@ -147,6 +167,10 @@ tests using mocked `fetch`; no Fastmail credentials belong in the repository.
   caller's pending keyword changes. Clear an overlay only if the resolving action is still the
   latest overlay for that email.
 - Folder moves do not have a simulated folder-membership view.
+- `updateThreads()` is one `patch` pending action over the admitted messages of all its threads,
+  built by the same `MessageSet.moveToFolder()`/`patchKeyword()` as the single-thread verbs (same
+  action kinds, overlays and folder restrictions); thread ids are checked, as one all-or-nothing
+  refusal, before anything is queued.
 - Sends have no simulation and are irreversible; `send()` resolves when queued, not when delivered.
 - Attachment content must never be uploaded before approval: it is stored in the binding's storage
   and uploaded in `applyAction()`/`applyDraftRevision()`. An existing attachment (by blob id) must
@@ -159,6 +183,22 @@ tests using mocked `fetch`; no Fastmail credentials belong in the repository.
   an earlier revision having been applied. Applies for one draft are serialized in memory
   (`#withDraftLock`). A draft send submits the approved snapshot as a fresh Email, then discards
   the stored copy.
+- `listDrafts()`/`getDraft()` also reach Fastmail-native drafts, on a whole-mailbox binding only
+  (a narrowed one may never see or adopt a draft it didn't create). Ids are told apart by lookup: a
+  draft record id (a UUID) first, otherwise a JMAP email id that must be in the Drafts-role
+  mailbox. Adopting stores a record with `applied: { actionId: 0, revision: content, emailId }`
+  (action ids start at 1, so every real revision supersedes it) and queues nothing; the
+  usual revision machinery then replaces the Email. `listDrafts()` skips any Email that is some
+  record's `applied.emailId` so a draft is listed once, under its record id. Adopted attachments
+  are `existing` refs by blob id. JMAP's `textBody` falls back to the HTML part, so
+  `draftContentFromEmail()` takes a body only when the part's type is `text/plain`/`text/html`.
+  Adopted records carry `adopted: true`: their update/delete are staged with no `actionKind`, so
+  they are never auto-approved (the person wrote the draft, not the agent); send never is either.
+  Fastmail replaces the Email whenever the person edits a draft, so an adopted record whose
+  `applied` is still the `actionId: 0` source is checked against Drafts: `listDrafts()` and
+  `getDraft()` drop it (when nothing is pending) so the new Email surfaces natively, and
+  update/delete/send at stage time and `applyDraftRevision()` at apply time refuse with
+  `RESOURCE_NOT_FOUND` while the source Email is gone (`assertAdoptedSourceLive`).
 - `FastmailThread.reply()` queues the same `send` action with `inReplyTo`/`references` taken from
   the thread's latest message. Fastmail threads strictly on these Message-ID headers (unlike
   Gmail's subject heuristic), so a reply sent through plain `send()` lands outside the thread. The

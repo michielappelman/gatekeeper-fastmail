@@ -14,13 +14,13 @@ deployment-wide secret.
 |---|---|---|
 | Browse and search | `listFolders`, `listThreads`, `searchThreads`, `listMessages`, `searchMessages`, `getThread`, `getMessage` | No (recorded) |
 | Read a message | `read`, `getHeaders`, `readAttachment`, `readAttachmentAsMarkdown` | No (recorded) |
-| Organize | `moveToFolder`, `addKeyword`, `removeKeyword`, `markRead`, `markUnread` | Yes, auto-approvable |
+| Organize | `moveToFolder`, `addKeyword`, `removeKeyword`, `markRead`, `markUnread`; for many threads at once, `updateThreads` | Yes, auto-approvable |
 | Draft | `createDraft`, `createReplyDraft`, `createForwardDraft`, draft `update`/`delete` | Yes, auto-approvable |
 | Send | `send`, `reply`, `forward`, draft `send` | Yes, always by a person |
 | Watch for new mail | `subscribeNewMessages` | The user enables each hook |
 | Read contacts (contacts resource) | `listGroups`, `getGroup`, `listContacts`, `searchContacts`, `getContact` | No (recorded) |
 | Change contacts | `createContact`, `updateContact`, `addToGroup`, `removeFromGroup` | Yes, auto-approvable |
-| Delete contacts | `deleteContact` | Yes, always by a person |
+| Delete contacts (whole-contacts binding only) | `deleteContact` | Yes, always by a person |
 
 What a connection gets depends on two choices the user makes when connecting:
 
@@ -62,7 +62,7 @@ export default async function(self, env) {
   const folders = await env.FASTMAIL.listFolders();
   const archive = folders.find((f) => f.role === "archive");
 
-  const cursor = await env.FASTMAIL.searchMessages("invoice");
+  const cursor = await env.FASTMAIL.searchMessages({ text: "invoice", unread: true });
   for (let page = await cursor.next(); page !== null; page = await cursor.next()) {
     for (const entry of page) {
       const message = await entry.ref.read();
@@ -87,10 +87,27 @@ The object model:
   listings, searches, drafts, `send()` and hooks.
 - **Thread** (`FastmailThread`): `messages()` oldest first; `reply()` and `createReplyDraft()`
   answer the newest message; organizing verbs act on every message in the thread.
+- **Several threads** (`session.updateThreads(threadIds, change)`): one queued action, one approval
+  and one `Email/set` for the in-scope messages of 1 to 500 threads (at most 1000 messages), with
+  `change` one of `{ moveToFolder }`, `{ addKeyword }`, `{ removeKeyword }`, `{ markRead: true }` or
+  `{ markUnread: true }`. A thread that is missing or has no message in scope refuses the whole call
+  (the same error for both) before anything is queued. The approval lists a sample of the messages
+  (each thread's newest first) and counts the rest. Narrowed bindings may only move into the folders
+  `listFolders()` shows them, as for one thread.
 - **Message** (`FastmailMessageRef`): `read()`, `getHeaders()`, attachments, `reply()`,
   `forward()`, and organizing verbs that act on that message only.
 - **Draft** (`FastmailSendableDraft`): `getMetadata()`, `getContent()`, `update()`, `delete()`,
   `send()`.
+
+**Searching.** `searchThreads()` and `searchMessages()` take a string (full text) or a
+`FastmailSearch`: `text`, `from`, `to`, `subject`, `unread`, `flagged`, `hasKeyword`, `notKeyword`,
+`hasAttachment`, `after` and `before` (dates as `YYYY-MM-DD` or a UTCDate). Every condition given
+must match, and at least one is required; texts are capped at 256 characters. Conditions map to one
+JMAP `FilterCondition`, except those sharing a key (e.g. `unread: true` with `notKeyword: "$draft"`,
+or `unread: false` with `flagged: true`), which are ANDed in a filter operator. A narrowed binding's
+folder or saved search is always ANDed with the caller's conditions. Messages report `folderIds`
+(only folders the binding's `listFolders()` shows), so an agent can tell from a folder's `role`
+where a message is, e.g. archived.
 
 There are no Gmail-style `archive()` or `trash()` verbs. Find the folder whose `role` is
 `"archive"` or `"trash"` in `listFolders()` and pass its id to `moveToFolder()`; folder names can be
@@ -122,6 +139,7 @@ target folder or keyword.
 
 **Auto-approval.** `getAutoApprovableActions()` lists the kinds a user may opt in to applying
 automatically: `draftCreate`, `draftUpdate`, `draftDelete`, `readState`, `keyword` and `move`.
+`updateThreads()` carries the same kind as the single-thread verb it stands for.
 Anything that sends mail carries no action kind, so it always waits for a person. Auto-approving the
 three draft kinds gives "the agent may prepare drafts, but nothing is sent without me".
 
@@ -195,19 +213,37 @@ The token needs the **Contacts** scope. Its contacts account comes from the sess
 looks it up once on first use (`UserAccount.getContactsGrant()`). A token without it fails with
 `CONTACTS_NOT_AUTHORIZED` until the account is reconnected with one that has it.
 
-Changes are queued for approval and written by `applyAction()` with one `ContactCard/set`; nothing
+Changes are queued for approval and written by `applyAction()` with `ContactCard/set`; nothing
 is simulated, so a change shows up in listings only once applied. Creating, editing and group
 membership carry the `contactCreate`/`contactUpdate`/`contactGroup` action kinds and may be
 auto-approved; `deleteContact()` carries none, so a person always approves it. The approval shows
-the exact JSContact properties written (`src/contact-input.ts` maps the agent's input to them).
+the exact JSContact card for a creation, and for an edit the requested changes as given
+(`src/contact-input.ts` maps the agent's input to JSContact).
 
 - `createContact()` writes into the default address book. Its `uid` is minted when queued, so an
   apply retried after a lost response finds the card instead of creating a second one. Given a
-  group (always, in a group binding), the same request adds that `uid` to the group's `members`.
-- `updateContact()` replaces each property given; `null` or `[]` removes it.
+  group (always, in a group binding), applying first adds that `uid` to the group's `members` (one
+  `ContactCard/set`, which fails if the group is gone, so no card is created), then creates the card
+  in a second one; each step is skipped when already done, so a retry completes either.
+- `updateContact(id, changes: FastmailContactChanges)` edits per entry. `emails`, `phones`,
+  `nicknames`, `organizations`, `titles`, `addresses` and `online` take `{ add?, remove? }`: `add`
+  appends entries under fresh map keys (a value already present is not added again), `remove`
+  deletes the matching ones (emails by address, case-insensitive; phones by digits and a leading
+  `+`; the rest by the exact string `FastmailContact` shows). `name` sets `name/full`; `givenName`
+  and `surname` replace only that component kind inside `name.components`, keeping the others
+  (prefix, middle, ...); `birthday`, `notes` and `kind` replace; `null` removes. Entries the
+  changes don't touch, with all their properties (structured address components, ...), stay as they
+  are. Staging refuses an empty change and a `remove` value that isn't on the card
+  (`INVALID_RESOURCE`, naming it).
+  Nothing is resolved when staging: the approval stores the validated changes, and applying reads
+  the card and the contacts `state`, builds a per-key PatchObject (`emails/<key>`, `name/full`,
+  `name/components`, ...) and sends it with `ifInState`. On `stateMismatch` it re-reads and
+  recomputes, up to 3 attempts, then fails with the action still approvable. A value to remove
+  that is already gone is a no-op, so edits made between staging and approval are kept.
 - A group binding's changes reach only the group's current members, checked when queued and again
-  when applied. It can remove members from its group but not add existing contacts to it, and
-  `deleteContact()` removes the contact from the whole account.
+  when applied. It can remove members from its group but not add existing contacts to it, and it
+  has no `deleteContact()` (refused at runtime too, pointing to `removeFromGroup()`): deleting
+  removes the contact from the whole account.
 
 The configurator (`src/configurator/fastmail-contacts-configurator-ui.tsx`) offers all contacts or
 one group, loading groups through `FastmailContactsConfiguratorUI`.
@@ -230,8 +266,22 @@ Each draft change is stored as a revision keyed by its action id (`src/drafts.ts
   never overwrite newer content.
 - Rejecting a revision falls back to the newest remaining one.
 
-`listDrafts()` covers drafts created through this connection. Drafts the user wrote in Fastmail are
-readable as threads in the Drafts folder. Edits the user makes in Fastmail are not reflected back.
+`listDrafts()` covers every draft in the Drafts folder on a whole-mailbox binding: first the drafts
+held by this connection (created here, or opened with `getDraft()`), each under its stable
+gatekeeper id, then the other Emails in the Drafts-role mailbox (up to the 100 newest, oldest first)
+under their own Fastmail email ids. The two id kinds are told apart by lookup: `getDraft(id)` first
+tries a draft record, then treats `id` as a JMAP email id. Opening a Fastmail email id **adopts**
+that draft: nothing is queued, a draft record is created whose applied revision is the Email's
+current content (addressees, subject, text and HTML bodies, `In-Reply-To`/`References`, and its
+attachments as references to their existing blobs, so editing doesn't re-upload them), and the
+draft then has a stable id (`getMetadata().id`), which `listDrafts()` shows from then on. Edits,
+`send()` and `delete()` use the normal revisions, and applying one replaces or destroys the adopted
+Email. Changes to an adopted draft are never auto-approved, since you wrote it rather than the agent.
+If you edit or discard the draft in Fastmail after it was opened (Fastmail replaces the Email on
+every save), the adopted copy is dropped on the next `listDrafts()`/`getDraft()` and the Email's new
+version appears under its new Fastmail id; an edit, send or delete of the old copy is refused with
+`RESOURCE_NOT_FOUND`, at queue time and again at approval time. A folder or search binding lists
+and opens only drafts created through its connection: other drafts are out of scope.
 
 Sending a draft queues the content the agent sees as a snapshot. On approval the gatekeeper submits
 that snapshot as a fresh Email (created in Drafts, submitted with the sending `identityId`, and moved
@@ -486,8 +536,12 @@ contributors and agents are in [AGENTS.md](AGENTS.md).
   fields, not Fastmail's web search syntax.
 - **Hooks report new mail only.** One folder (or scope) per hook; no moves, flag changes or
   deletions. Mail arriving during a `cannotCalculateChanges` gap is not delivered.
-- **Drafts are one-way.** `listDrafts()` covers drafts made through this connection, and edits made
-  in Fastmail are not reflected back.
+- **Drafts are one-way.** `listDrafts()` also lists drafts Fastmail holds that this connection didn't
+  make (the 100 newest in the Drafts folder), but a draft's content is a snapshot taken when it is
+  opened. If the draft is edited or discarded in Fastmail afterwards (which replaces the Email), the
+  stale copy is dropped and the new Email is listed as a fresh native draft; changes already queued
+  against the old copy are refused as no longer existing. A native draft's reply link is only its
+  `In-Reply-To`/`References` headers, so sending it doesn't mark the original `$answered`.
 - **No send receipt.** `send()`, `reply()` and `forward()` resolve when queued, and return no
   message id.
 - **Token rotation is a reconnect.** There is no refresh cycle.

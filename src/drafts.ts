@@ -22,8 +22,10 @@ import {
   updateEmails,
   writeDraft,
   type FastmailAccountInfo,
+  getDraftEmail,
+  type AttachmentRef,
 } from "./fastmail-api";
-import type { JmapEmailAddress } from "./fastmail-types";
+import type { JmapEmailAddress, JmapEmailObject } from "./fastmail-types";
 import type { FastmailAddress, FastmailDraftInfo } from "./types";
 
 /** What applying a revision needs from the stored grant. */
@@ -58,11 +60,109 @@ export function toDraftInfo(record: DraftRecord, content: DraftContent, at: numb
     cc: toAgentAddresses(content.cc),
     bcc: toAgentAddresses(content.bcc),
     subject: content.subject,
-    isReply: record.answersEmailId !== undefined,
+    isReply: record.answersEmailId !== undefined || (content.inReplyTo?.length ?? 0) > 0,
     isForward: record.forwardsEmailId !== undefined,
     attachments: attachmentSummaries(content.attachments),
     updatedAt: new Date(at),
   };
+}
+
+/** The text of the first body part when it is of `type`: JMAP's `textBody` falls back to the HTML part when there is no plain text. */
+function bodyOfType(email: JmapEmailObject, parts: JmapEmailObject["textBody"], type: string): string | undefined {
+  const part = parts?.[0];
+  return part?.partId && part.type === type ? email.bodyValues?.[part.partId]?.value : undefined;
+}
+
+/**
+ * What an Email in Drafts holds, as the content of a draft revision: addressees, subject, bodies,
+ * threading headers, and its attachments as references to their blobs in the Email.
+ */
+export function draftContentFromEmail(email: JmapEmailObject): DraftContent {
+  const content: DraftContent = {
+    to: email.to ?? [],
+    subject: email.subject ?? "",
+  };
+  if (email.cc?.length) content.cc = email.cc;
+  if (email.bcc?.length) content.bcc = email.bcc;
+  const text = bodyOfType(email, email.textBody, "text/plain");
+  const html = bodyOfType(email, email.htmlBody, "text/html");
+  if (text !== undefined) content.textBody = text;
+  if (html !== undefined) content.htmlBody = html;
+  if (email.inReplyTo?.length) content.inReplyTo = email.inReplyTo;
+  if (email.references?.length) content.references = email.references;
+  if (email.attachments?.length) {
+    content.attachments = email.attachments.map((attachment): AttachmentRef => ({
+      kind: "existing",
+      filename: attachment.name ?? "attachment",
+      mimeType: attachment.type,
+      size: attachment.size,
+      blobId: attachment.blobId,
+      fromEmailId: email.id,
+      source: "this draft in Fastmail",
+      ...attachment.cid ? { cid: attachment.cid.replace(/^<|>$/g, "") } : {},
+    }));
+  }
+  return content;
+}
+
+/** A draft in Drafts that this connection doesn't hold, as listed: its id is the Email's own. */
+export function nativeDraftInfo(email: JmapEmailObject): FastmailDraftInfo {
+  return toDraftInfo({ id: email.id, pending: {} }, draftContentFromEmail(email), Date.parse(email.receivedAt));
+}
+
+/**
+ * A record for the Email `email` in Drafts, as if this connection had written it: its content is
+ * the Email's, already applied, so an edit, send or delete goes through the usual revisions and
+ * replaces or destroys that Email. The caller stores it.
+ */
+export function adoptedDraftRecord(email: JmapEmailObject, fallbackFrom: string | undefined): DraftRecord {
+  const from = email.from?.[0]?.email ?? fallbackFrom;
+  return {
+    id: crypto.randomUUID(),
+    adopted: true,
+    ...from !== undefined ? { from } : {},
+    pending: {},
+    // Action ids start at 1, so every later revision supersedes this one.
+    applied: {
+      actionId: 0,
+      revision: { kind: "content", content: draftContentFromEmail(email), at: Date.parse(email.receivedAt) },
+      emailId: email.id,
+    },
+  };
+}
+
+/**
+ * The Email an adopted draft was taken from, while no revision of this connection has been applied
+ * (so it is still the one Fastmail's own editor holds). Undefined for any other record.
+ */
+export function adoptedSourceEmailId(record: DraftRecord): string | undefined {
+  return record.adopted && record.applied?.actionId === 0 ? record.applied.emailId : undefined;
+}
+
+/** Whether `emailId` is still an Email in the Drafts mailbox. */
+export async function emailInDrafts(
+  grant: DraftGrant, emailId: string, fetchImpl: typeof fetch = fetch,
+): Promise<boolean> {
+  const { apiUrl, apiToken, accountId, hasSubmission } = grant;
+  const draftsMailboxId = await findDraftsMailboxId(apiUrl, apiToken, accountId, hasSubmission, fetchImpl);
+  const email = await getDraftEmail(apiUrl, apiToken, accountId, hasSubmission, emailId, fetchImpl);
+  return email?.mailboxIds[draftsMailboxId] === true;
+}
+
+/**
+ * Refuses a change to an adopted draft whose source Email has gone from Drafts (edited or discarded
+ * in Fastmail since it was opened): the record's content is stale and applying would overwrite or
+ * duplicate what is there now. Anything else passes.
+ */
+export async function assertAdoptedSourceLive(
+  grant: DraftGrant, record: DraftRecord, fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const sourceId = adoptedSourceEmailId(record);
+  if (sourceId !== undefined && !await emailInDrafts(grant, sourceId, fetchImpl)) {
+    throw new FastmailError(
+      "RESOURCE_NOT_FOUND",
+      "This Fastmail draft was changed or discarded in Fastmail since it was opened; list the drafts again.");
+  }
 }
 
 /**
@@ -90,6 +190,7 @@ export async function applyDraftRevision(
     putDraftRecord(kv, record);
     return;
   }
+  await assertAdoptedSourceLive(grant, record, fetchImpl);
 
   const { apiUrl, apiToken, accountId, hasSubmission } = grant;
   const previousEmailId = record.applied?.emailId;

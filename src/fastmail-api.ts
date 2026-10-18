@@ -186,12 +186,13 @@ export async function listMailboxes(
 // Threads / messages
 
 const THREAD_ENTRY_PROPERTIES = [
-  "id", "threadId", "subject", "from", "receivedAt", "preview", "keywords", ...BULK_HEADER_PROPERTIES,
+  "id", "threadId", "mailboxIds", "subject", "from", "receivedAt", "preview", "keywords", ...BULK_HEADER_PROPERTIES,
 ];
 
 export type RawThreadEntry = BulkHeaders & {
   id: string;
   threadId: string;
+  mailboxIds: Record<string, boolean>;
   subject: string | null;
   from: JmapEmailAddress[] | null;
   receivedAt: string;
@@ -317,6 +318,21 @@ export async function getThreadMetadata(
   const thread = (result.list as { id: string; emailIds: string[] }[] | undefined)?.[0];
   if (!thread) throw new FastmailError("RESOURCE_NOT_FOUND", `Fastmail thread ${threadId} was not found.`);
   return { threadId: thread.id, messageIds: thread.emailIds };
+}
+
+/**
+ * Fetches several threads' message ids with one `Thread/get`. A thread that doesn't exist is left
+ * out of the result.
+ */
+export async function getThreadsMetadata(
+  apiUrl: string, apiToken: string, accountId: string, hasSubmission: boolean, threadIds: string[],
+  fetchImpl: typeof fetch = fetch,
+): Promise<Map<string, string[]>> {
+  if (threadIds.length === 0) return new Map();
+  const result = await call(
+    apiUrl, apiToken, usingFor(hasSubmission), "Thread/get", { accountId, ids: threadIds }, fetchImpl);
+  const list = (result.list as { id: string; emailIds: string[] }[] | undefined) ?? [];
+  return new Map(list.map(thread => [thread.id, thread.emailIds]));
 }
 
 const MESSAGE_PROPERTIES = [
@@ -675,6 +691,51 @@ export async function findDraftsMailboxId(
   return draftsMailboxId;
 }
 
+/** What a draft listing shows of an Email in Drafts. */
+const DRAFT_LIST_PROPERTIES = ["id", "mailboxIds", "from", "to", "cc", "bcc", "subject", "receivedAt", "attachments", "inReplyTo"];
+/** What adopting a draft needs: its listing properties plus bodies and threading headers. */
+const DRAFT_PROPERTIES = [...DRAFT_LIST_PROPERTIES, "references", "textBody", "htmlBody", "bodyValues"];
+
+/** At most this many Emails are listed from the Drafts mailbox, newest first. */
+export const MAX_LISTED_DRAFTS = 100;
+
+/** The newest Emails in the Drafts mailbox, without their bodies, oldest first. */
+export async function listDraftEmails(
+  apiUrl: string, apiToken: string, accountId: string, hasSubmission: boolean, draftsMailboxId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<JmapEmailObject[]> {
+  const using = usingFor(hasSubmission);
+  const queried = await call(apiUrl, apiToken, using, "Email/query", {
+    accountId,
+    filter: { inMailbox: draftsMailboxId },
+    sort: [{ property: "receivedAt", isAscending: false }],
+    limit: MAX_LISTED_DRAFTS,
+  }, fetchImpl);
+  const ids = (queried.ids as string[] | undefined) ?? [];
+  if (ids.length === 0) return [];
+  const fetched = await call(apiUrl, apiToken, using, "Email/get", {
+    accountId, ids, properties: DRAFT_LIST_PROPERTIES,
+  }, fetchImpl);
+  const order = new Map(ids.map((id, index) => [id, index]));
+  return ((fetched.list as JmapEmailObject[] | undefined) ?? [])
+    .toSorted((a, b) => (order.get(b.id) ?? 0) - (order.get(a.id) ?? 0));
+}
+
+/** One Email with the properties adopting it as a draft needs, or undefined if it doesn't exist. */
+export async function getDraftEmail(
+  apiUrl: string, apiToken: string, accountId: string, hasSubmission: boolean, emailId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<JmapEmailObject | undefined> {
+  const result = await call(apiUrl, apiToken, usingFor(hasSubmission), "Email/get", {
+    accountId,
+    ids: [emailId],
+    properties: DRAFT_PROPERTIES,
+    fetchTextBodyValues: true,
+    fetchHTMLBodyValues: true,
+  }, fetchImpl);
+  return (result.list as JmapEmailObject[] | undefined)?.[0];
+}
+
 /**
  * Saves a draft in Drafts, replacing `replacesEmailId` in the same `Email/set` when given. JMAP
  * Emails are immutable apart from keywords and mailboxes (RFC 8621 §4.6), so an edited draft is a
@@ -914,6 +975,19 @@ export async function getContactCards(
   return list.toSorted((a, b) => (byOrder.get(a.id) ?? 0) - (byOrder.get(b.id) ?? 0));
 }
 
+/**
+ * One card by id with the contacts `state` it was read at, to pass as `setContactCards()`'s
+ * `ifInState`; the card is undefined when it doesn't exist.
+ */
+export async function getContactCardWithState(
+  apiUrl: string, apiToken: string, accountId: string, id: string, fetchImpl: typeof fetch = fetch,
+): Promise<{ card: JmapContactCard | undefined; state: string }> {
+  const result = await call(apiUrl, apiToken, CONTACTS_USING, "ContactCard/get", {
+    accountId, ids: [id], properties: CONTACT_PROPERTIES,
+  }, fetchImpl);
+  return { card: (result.list as JmapContactCard[] | undefined)?.[0], state: result.state as string };
+}
+
 /** Every contact group (a card of kind `group`) in the account, with its member uids. */
 export async function listContactGroups(
   apiUrl: string, apiToken: string, accountId: string, fetchImpl: typeof fetch = fetch,
@@ -964,7 +1038,8 @@ export async function findContactCardByUid(
 
 /**
  * One `ContactCard/set` (RFC 9610 §3.4): creations, patches and destructions applied together.
- * Throws if Fastmail refuses any of them.
+ * Throws if Fastmail refuses any of them. With `ifInState`, nothing is written and `false` is
+ * returned when the cards changed since that state (`stateMismatch`); otherwise `true`.
  */
 export async function setContactCards(
   apiUrl: string, apiToken: string, accountId: string,
@@ -972,12 +1047,17 @@ export async function setContactCards(
     create?: Record<string, Record<string, unknown>>;
     update?: Record<string, Record<string, unknown>>;
     destroy?: string[];
+    ifInState?: string;
   },
   fetchImpl: typeof fetch = fetch,
-): Promise<void> {
-  const result = await call(apiUrl, apiToken, CONTACTS_USING, "ContactCard/set", {
-    accountId, ...changes,
+): Promise<boolean> {
+  const parsed = await request(apiUrl, apiToken, {
+    using: CONTACTS_USING,
+    methodCalls: [["ContactCard/set", { accountId, ...changes }, "c1"]],
   }, fetchImpl);
+  const [responseName, response] = parsed.methodResponses?.find(([, , id]) => id === "c1") ?? [];
+  if (responseName === "error" && (response as unknown as JmapMethodError).type === "stateMismatch") return false;
+  const result = methodResult(parsed, "c1", "ContactCard/set");
   for (const key of ["notCreated", "notUpdated", "notDestroyed"] as const) {
     const failures = result[key] as Record<string, JmapMethodError> | null | undefined;
     const [id, error] = Object.entries(failures ?? {})[0] ?? [];
@@ -986,4 +1066,5 @@ export async function setContactCards(
         methodErrorCode(error), `Fastmail refused to change contact ${id}: ${describeMethodError(error)}.`);
     }
   }
+  return true;
 }
