@@ -97,8 +97,8 @@ There are no Gmail-style `archive()` or `trash()` verbs. Find the folder whose `
 renamed, roles cannot.
 
 Errors carry a stable `FastmailErrorCode` (`src/errors.ts`), such as `AUTH_EXPIRED`,
-`SUBMISSION_NOT_AUTHORIZED`, `RESOURCE_NOT_FOUND`, `UNSUPPORTED_FOR_MARKDOWN` and
-`TOO_LARGE_FOR_MARKDOWN`.
+`SUBMISSION_NOT_AUTHORIZED`, `CONTACTS_NOT_AUTHORIZED`, `RESOURCE_NOT_FOUND`,
+`UNSUPPORTED_FOR_MARKDOWN` and `TOO_LARGE_FOR_MARKDOWN`.
 
 ## How a change runs
 
@@ -185,7 +185,10 @@ A contact group is a ContactCard of kind `group` whose `members` set lists the `
 in it. A group binding re-reads that set for every page and every `getContact()`, so membership is
 live: listings query `ContactCard/query` with the members' uids ORed in, a card outside the group is
 refused exactly like a missing one, and a deleted group makes every call fail as not found. Group
-cards themselves are never returned as contacts.
+cards themselves are never returned as contacts. They are dropped by the gatekeeper after the query
+(the cursor's `retain`), not by a `kind` condition: Fastmail mis-parses a `kind` condition nested in
+a filter operator (it moves `kind` onto the operator and leaves `{}`, so `NOT {kind: "group"}`
+matches nothing), while nested `uid` and `text` conditions work.
 
 The token needs the **Contacts** scope. Its contacts account comes from the session resource's
 `primaryAccounts["urn:ietf:params:jmap:contacts"]`; a grant stored before contacts were supported
@@ -442,8 +445,9 @@ The starter must include `packages/*` in `pnpm-workspace.yaml`, and its deploy w
 What the Worker needs:
 
 - **Bindings.** `WORKERS_AI` (Workers AI, for `readAttachmentAsMarkdown()`), and Durable Objects
-  `UserAccount`, `FastmailGatekeeperImpl` and `FastmailHookDriver` (SQLite-backed, migrations `v0`
-  and `v1`). Compatibility flags `nodejs_compat` and `allow_irrevocable_stub_storage`.
+  `UserAccount`, `FastmailGatekeeperImpl`, `FastmailHookDriver` and `FastmailContactsGatekeeperImpl`
+  (SQLite-backed, migrations `v0` to `v2`). Compatibility flags `nodejs_compat` and
+  `allow_irrevocable_stub_storage`.
 - **`BASE_URL`.** The public URL the router serves the gatekeeper on, for example
   `https://os.example.com/gatekeeper/fastmail`. JMAP push needs it to be public HTTPS; otherwise
   hooks fall back to polling.

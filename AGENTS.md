@@ -121,9 +121,18 @@ Important protocol details:
 - Apply thread mutations with one `Email/set` patch to every message id in the thread.
 - Convert upstream HTTP and method errors into stable `FastmailErrorCode` values. Session code
   should not branch on raw response bodies or JMAP error strings.
+- Contacts use JMAP Core + Contacts (RFC 9610) against `primaryAccounts[urn:ietf:params:jmap:contacts]`.
+  A group's `members` keys are its member cards' plain `uid`s, so group listings query an OR of
+  `{uid}` conditions. Never put a `kind` condition inside a filter operator: Fastmail hoists it onto
+  the operator (seen live: `NOT {kind: "group"}` matches nothing), so contact listings drop group
+  cards client-side through `OffsetCursor`'s `retain`, which keeps paging by the raw page.
+- Contact changes are one `ContactCard/set`. A creation carries a `uid` minted when it was queued,
+  so a retried apply looks the card up by `uid` instead of creating it twice, and goes into the
+  default `AddressBook`.
 
-When changing protocol code, update `__tests__/fastmail-client.test.ts` and keep the tests using
-mocked `fetch`; no Fastmail credentials belong in the repository.
+When changing protocol code, update `__tests__/fastmail-client.test.ts` (mail) or
+`__tests__/contacts.test.ts` (contacts; its fake reproduces Fastmail's `kind` quirk) and keep the
+tests using mocked `fetch`; no Fastmail credentials belong in the repository.
 
 ## Cache and pending-action behavior
 
@@ -182,7 +191,8 @@ hand: change `cloudflare.config.ts` and run `pnpm configs:generate` from the sta
 
 Tests use mocked `fetch` and do not need Fastmail credentials. Coverage includes session discovery,
 capability checks, JMAP request/response mapping, resource validation, caching, simulated keywords,
-and configurator behavior. Full live-account and Durable Object `ctx.exports` integration coverage
+contacts (listing, group scope, queued changes and their apply), and configurator behavior. Full
+live-account and Durable Object `ctx.exports` integration coverage
 is not part of the current test suite. The hook driver's logic (`HookDriver`) is tested on fake
 storage with a test-side Web Push encryptor standing in for Fastmail (`__tests__/hooks.test.ts`),
 and `__tests__/hooks-worker.test.ts` reaches the real Durable Object.
