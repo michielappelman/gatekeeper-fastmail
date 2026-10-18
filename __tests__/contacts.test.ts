@@ -41,13 +41,21 @@ const CARDS: JmapContactCard[] = [
 type Filter = { operator?: "AND" | "OR" | "NOT"; conditions?: Filter[]; kind?: string; uid?: string; text?: string };
 type MethodArgs = { filter?: Filter; position?: number; limit?: number; ids?: string[]; "#ids"?: { resultOf: string } };
 
-/** Evaluates the subset of RFC 9610 filters the gatekeeper sends. */
+/**
+ * Evaluates the subset of RFC 9610 filters the gatekeeper sends. Like Fastmail (seen live), it
+ * hoists a `kind` condition nested in an operator onto the operator itself, leaving `{}` behind,
+ * so `NOT {kind: "group"}` matches nothing.
+ */
 function matches(card: JmapContactCard, filter: Filter | undefined): boolean {
   if (!filter) return true;
-  const conditions = filter.conditions ?? [];
-  if (filter.operator === "AND") return conditions.every(c => matches(card, c));
-  if (filter.operator === "OR") return conditions.some(c => matches(card, c));
-  if (filter.operator === "NOT") return !conditions.some(c => matches(card, c));
+  if (filter.operator) {
+    const hoisted = filter.conditions?.find(c => !c.operator && c.kind !== undefined)?.kind;
+    if (hoisted !== undefined && card.kind !== hoisted) return false;
+    const conditions = (filter.conditions ?? []).map(c => c.operator ? c : { ...c, kind: undefined });
+    if (filter.operator === "AND") return conditions.every(c => matches(card, c));
+    if (filter.operator === "OR") return conditions.some(c => matches(card, c));
+    return !conditions.some(c => matches(card, c));
+  }
   if (filter.kind !== undefined && card.kind !== filter.kind) return false;
   if (filter.uid !== undefined && card.uid !== filter.uid) return false;
   if (filter.text !== undefined && !JSON.stringify(card).toLowerCase().includes(filter.text.toLowerCase())) return false;

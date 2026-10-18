@@ -70,9 +70,6 @@ type ContactsGrant = { apiUrl: string; apiToken: string; accountId: string };
 /** A JMAP `Id` (RFC 8620 §1.2), as `getContact()` accepts it. */
 const JMAP_ID = /^[A-Za-z0-9_-]{1,255}$/;
 
-/** Cards that are contacts, not groups; the whole-book listing's base filter. */
-const NOT_GROUP: JmapFilter = { operator: "NOT", conditions: [{ kind: "group" }] };
-
 /** Change kinds a user may opt in to auto-approving. Deleting a contact has none: a person decides. */
 const AUTO_APPROVABLE_KINDS = {
   contactCreate: { tag: "contactCreate", label: "Create a contact" },
@@ -390,7 +387,10 @@ export class FastmailContactsSessionImpl extends RpcTarget implements FastmailCo
       pageSize: 50,
       dispose: () => approvalQueue[Symbol.dispose](),
       fetchPage: (offset, limit) => call(async grant => {
-        const conditions: JmapFilter[] = [NOT_GROUP];
+        // Groups are dropped by `retain`, not by the query: Fastmail mis-parses a `kind` condition
+        // nested in a FilterOperator (it hoists `kind` to the operator itself, so
+        // NOT{kind: group} matches nothing), while `uid` and `text` conditions nest correctly.
+        const conditions: JmapFilter[] = [];
         if (group !== undefined) {
           // Membership is re-read for every page, so it is never older than the page it filters.
           const uids = memberUids(await loadGroup(grant, group));
@@ -398,10 +398,13 @@ export class FastmailContactsSessionImpl extends RpcTarget implements FastmailCo
           conditions.push({ operator: "OR", conditions: uids.map(uid => ({ uid })) });
         }
         if (text) conditions.push({ text });
-        const cards = await queryContactPage(
-          grant.apiUrl, grant.apiToken, grant.accountId, { operator: "AND", conditions }, offset, limit);
+        const filter = conditions.length > 1 ? { operator: "AND", conditions } : conditions[0];
+        const cards = await queryContactPage(grant.apiUrl, grant.apiToken, grant.accountId, filter, offset, limit);
+        // Group cards keep `kind: "group"` here, for `retain` to drop.
         return cards.map(toAgentContact);
       }),
+      // The walk advances by the raw page, so a page of only groups doesn't end it early.
+      retain: page => page.filter(contact => contact.kind !== "group"),
       authorizePage: (items, { terminal }) => approvalQueue.authorizeObservation({
         title: "List Fastmail contacts",
         description: terminal && items.length === 0
