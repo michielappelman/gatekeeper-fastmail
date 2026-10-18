@@ -91,14 +91,21 @@ import {
 } from "./hooks";
 import {
   describeSearchFilter,
+  FASTMAIL_CONTACTS_RESOURCE,
   FASTMAIL_RESOURCE,
+  isContactsResourceUrl,
   MAILBOX_SCOPE,
   normalizeSearchFilter,
+  parseContactsResourceUrl,
   parseResourceUrl,
   SUPPORTED_RESOURCES,
   toResourceUrl,
   type FastmailScope,
 } from "./resource";
+import {
+  FastmailContactsConfiguratorUI,
+  type FastmailContactsGatekeeperImplProps,
+} from "./contacts";
 import { outOfScope, ScopeGuard } from "./scope";
 import type {
   FastmailAddress,
@@ -124,6 +131,7 @@ import type {
   FastmailAccountConfiguratorValues,
 } from "./configurator/fastmail-account-configurator-types";
 import FASTMAIL_ACCOUNT_CONFIGURATOR_HTML from "./generated/fastmail-account-configurator-ui.txt";
+import FASTMAIL_CONTACTS_CONFIGURATOR_HTML from "./generated/fastmail-contacts-configurator-ui.txt";
 
 type Env = Cloudflare.Env & {
   BASE_URL?: string;
@@ -203,7 +211,7 @@ const CONNECT_FORM_HTML = (params: { actionUrl: string; error?: string }) => `<!
         <summary>How to create an API token</summary>
         <ol>
           <li>Open <a href="https://app.fastmail.com/settings/security/tokens" target="_blank" rel="noopener">Settings &rarr; Password &amp; Security &rarr; API tokens</a>.</li>
-          <li>Create a new token and grant it "Mail" access (add "Email submission" too if you want this connection to be able to send mail on your behalf).</li>
+          <li>Create a new token and grant it "Mail" access (add "Email submission" too if you want this connection to be able to send mail on your behalf, and "Contacts" to let it read and, with your approval, change your contacts).</li>
           <li>Copy the token and paste it above.</li>
         </ol>
       </details>
@@ -282,11 +290,11 @@ export class GatekeeperVendor extends WorkerEntrypoint<Env> implements Gatekeepe
       url: "https://www.fastmail.com",
       logo: { url: FASTMAIL_LOGO_URL },
       color: "#e6f2fa",
-      tagline: "Read, organize, and send email through your Fastmail mailbox",
+      tagline: "Read, organize, and send email, and manage contacts, through your Fastmail account",
       description:
           "Connect a Fastmail API token so Cloudflare OS can read, search, organize, and send " +
-          "email through your Fastmail account over JMAP. The token grants exactly the access you " +
-          "chose when creating it in Fastmail's own settings.",
+          "email, and read and update your contacts, through your Fastmail account over JMAP. The token grants " +
+          "exactly the access you chose when creating it in Fastmail's own settings.",
       providesAuth: false,
     };
   }
@@ -438,6 +446,29 @@ export class UserAccount extends DurableObject<Env> {
     return grant;
   }
 
+  /**
+   * The grant plus the account that holds the user's contacts. Grants stored before contacts were
+   * supported never recorded it, so a missing one is looked up again from the session resource
+   * (and kept once found). A token without the Contacts scope gets `CONTACTS_NOT_AUTHORIZED`.
+   */
+  async getContactsGrant(): Promise<{ apiUrl: string; apiToken: string; accountId: string }> {
+    let grant = await this.getGrant();
+    if (!grant.contactsAccountId) {
+      const info = await fetchAccountInfo(grant.apiToken);
+      if (info.contactsAccountId) {
+        grant = { ...grant, contactsAccountId: info.contactsAccountId };
+        this.ctx.storage.kv.put("grant", grant);
+      }
+    }
+    if (!grant.contactsAccountId) {
+      throw new FastmailError(
+        "CONTACTS_NOT_AUTHORIZED",
+        "This Fastmail connection's API token does not grant Contacts access. Reconnect with a " +
+        "token that includes the Contacts scope.");
+    }
+    return { apiUrl: grant.apiUrl, apiToken: grant.apiToken, accountId: grant.contactsAccountId };
+  }
+
   /** Called by a session when a live JMAP call comes back 401, since there is no refresh to retry
    * first — a rejected token here means it was revoked or deleted in Fastmail's own settings. */
   async noteCredentialsExpired(): Promise<void> {
@@ -494,19 +525,27 @@ export class FastmailGatekeeperUserImpl extends WorkerEntrypoint<Env, FastmailGa
     class: DurableObjectClass<Gatekeeper<any>>;
     resource: SupportedResource;
   }> {
+    if (isContactsResourceUrl(url)) {
+      const props: FastmailContactsGatekeeperImplProps = {
+        userObjectId: this.ctx.props.userObjectId, scope: parseContactsResourceUrl(url),
+      };
+      return {
+        class: this.ctx.exports.FastmailContactsGatekeeperImpl({ props }), resource: FASTMAIL_CONTACTS_RESOURCE,
+      };
+    }
     const scope = parseResourceUrl(url);
     const props: FastmailGatekeeperImplProps = { userObjectId: this.ctx.props.userObjectId, scope };
     return { class: this.ctx.exports.FastmailGatekeeperImpl({ props }), resource: FASTMAIL_RESOURCE };
   }
 
-  /**
-   * v1 offers exactly one resource shape (the whole mailbox) with no user-selectable inputs, but the
-   * connect modal still unconditionally drives every SupportedResource through this method before
-   * "Add connection" can be enabled — there is no way to opt out of it. So this returns a trivial
-   * configurator (no fields, always ready) rather than throwing, matching gatekeeper-zoominfo's
-   * whole-account resource.
-   */
+  /** The connect modal drives every SupportedResource through this before "Add connection" is enabled. */
   async startResourceConfigurator(resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+    if (resourceUrlPattern === FASTMAIL_CONTACTS_RESOURCE.urlPattern) {
+      return {
+        iframeHtml: FASTMAIL_CONTACTS_CONFIGURATOR_HTML,
+        ui: new RpcStub(new FastmailContactsConfiguratorUI(this.#userAccount())),
+      };
+    }
     if (resourceUrlPattern !== FASTMAIL_RESOURCE.urlPattern) {
       throw new Error(`Unsupported Fastmail resource configurator type: ${resourceUrlPattern}`);
     }

@@ -617,3 +617,144 @@ export interface FastmailScopedSession extends FastmailScopedDraftOnlySession {
   /** As `FastmailScopedDraftOnlySession.subscribeNewMessages()`, with a thread and message that can also reply. */
   subscribeNewMessages(hook: RpcStub<FastmailMessageHook<FastmailThread, FastmailMessageRef>>): Promise<void>;
 }
+
+/** One email address of a contact. */
+export type FastmailContactEmail = {
+  address: string;
+  /** The contact's own label for it, or its context (`"work"`, `"private"`), when set. */
+  label?: string;
+};
+
+/** One phone number of a contact. */
+export type FastmailContactPhone = {
+  number: string;
+  /** The contact's own label for it, or its context and features (`"work, mobile"`), when set. */
+  label?: string;
+};
+
+/**
+ * One contact card. Emails and phone numbers come most-preferred first. Contact groups are not
+ * contacts: see `FastmailContactGroup`.
+ */
+export type FastmailContact = {
+  /** Pass this to `getContact()`. */
+  id: string;
+  /** JSContact kind: usually `"individual"` (a person) or `"org"` (an organization). */
+  kind: string;
+  /** Display name: the full name, else the name parts, else the organization or first address. */
+  name: string;
+  givenName?: string;
+  surname?: string;
+  nicknames: string[];
+  emails: FastmailContactEmail[];
+  phones: FastmailContactPhone[];
+  /** Organization names, with any units, e.g. `"Acme / Research"`. */
+  organizations: string[];
+  /** Job titles and roles. */
+  titles: string[];
+  /** Postal addresses, one line each. */
+  addresses: string[];
+  /** Websites and online-service handles. */
+  online: string[];
+  /** `YYYY-MM-DD`, or `--MM-DD` when the year is unknown. */
+  birthday?: string;
+  notes?: string;
+};
+
+/** One contact group: a named list of contacts. */
+export type FastmailContactGroup = {
+  /** Pass this to `listContacts()`/`searchContacts()`'s `groupId`. */
+  id: string;
+  name: string;
+  memberCount: number;
+};
+
+/**
+ * A contact to create, or the fields of one to change. In `updateContact()` every field given
+ * replaces that whole part of the card and fields left out stay as they are; `[]` or `null` clears
+ * one. `name`, `givenName` and `surname` together form the card's name, so giving any of them
+ * replaces the whole name with the ones given.
+ */
+export type FastmailContactInput = {
+  /** `"individual"` (a person, the default for a new contact) or `"org"` (an organization). */
+  kind?: "individual" | "org";
+  /** The full display name; when left out, the name parts make it up. */
+  name?: string;
+  givenName?: string;
+  surname?: string;
+  nicknames?: string[];
+  /** A `label` of `"work"` or `"private"` is stored as that context; anything else as a label. */
+  emails?: FastmailContactEmail[];
+  /** As `emails`; labels `"mobile"`, `"voice"`, `"fax"`, `"text"`, `"pager"`, `"video"` are phone
+   * features, and may be combined with a context, e.g. `"work, mobile"`. */
+  phones?: FastmailContactPhone[];
+  /** Organization names; `"Acme / Research"` is the unit Research of Acme. */
+  organizations?: string[];
+  titles?: string[];
+  /** Postal addresses, one line each. */
+  addresses?: string[];
+  /** Websites (`https://...`) or online-service handles. */
+  online?: string[];
+  /** `YYYY-MM-DD`, or `--MM-DD` when the year is unknown. */
+  birthday?: string | null;
+  notes?: string | null;
+};
+
+/**
+ * Access to the contacts of one connected Fastmail account. Listings are in Fastmail's order.
+ *
+ * Changes are queued for the user's approval and resolve once queued, not once applied: they show
+ * up in listings only after approval. Creating, editing and group membership changes may be
+ * auto-approved if the user allows it; deleting always waits for a person. None can be reverted
+ * through this connection.
+ */
+export interface FastmailContactsSession {
+  /** Lists the account's contact groups. */
+  listGroups(): Promise<FastmailContactGroup[]>;
+  /** Lists every contact, or only the members of `groupId`. */
+  listContacts(groupId?: string): Promise<Cursor<FastmailContact>>;
+  /**
+   * Searches contacts by any text on the card (name, email, phone, organization, address, notes),
+   * optionally only within `groupId`.
+   */
+  searchContacts(query: string, groupId?: string): Promise<Cursor<FastmailContact>>;
+  /** Opens one contact by id. */
+  getContact(id: string): Promise<FastmailContact>;
+  /** Queues creating a contact in the default address book, and adding it to `groupId` if given. */
+  createContact(contact: FastmailContactInput, groupId?: string): Promise<void>;
+  /** Queues changing the given fields of a contact. */
+  updateContact(id: string, changes: FastmailContactInput): Promise<void>;
+  /** Queues deleting a contact from the account. Always needs a person's approval. */
+  deleteContact(id: string): Promise<void>;
+  /** Queues adding a contact to a group. */
+  addToGroup(contactId: string, groupId: string): Promise<void>;
+  /** Queues removing a contact from a group; the contact itself stays. */
+  removeFromGroup(contactId: string, groupId: string): Promise<void>;
+}
+
+/**
+ * Access to one contact group of a connected Fastmail account, chosen when this connection was
+ * created. Only the group's current members are visible: a contact removed from the group leaves
+ * scope too. Changes are queued for approval as for `FastmailContactsSession`.
+ */
+export interface FastmailGroupContactsSession {
+  /** This connection's group, with its current name and size. */
+  getGroup(): Promise<FastmailContactGroup>;
+  /** Lists the group's members. */
+  listContacts(): Promise<Cursor<FastmailContact>>;
+  /** Searches the group's members by any text on their cards. */
+  searchContacts(query: string): Promise<Cursor<FastmailContact>>;
+  /** Opens one of the group's members by id. */
+  getContact(id: string): Promise<FastmailContact>;
+  /** Queues creating a contact in the default address book as a member of this group. */
+  createContact(contact: FastmailContactInput): Promise<void>;
+  /** Queues changing the given fields of one of the group's members. */
+  updateContact(id: string, changes: FastmailContactInput): Promise<void>;
+  /**
+   * Queues deleting one of the group's members from the account entirely (not just from the group;
+   * use `removeFromGroup()` for that). Always needs a person's approval.
+   */
+  deleteContact(id: string): Promise<void>;
+  /** Queues removing a member from this group; the contact itself stays in the account. */
+  removeFromGroup(contactId: string): Promise<void>;
+}

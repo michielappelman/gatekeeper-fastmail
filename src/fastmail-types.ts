@@ -12,6 +12,9 @@ import type { BulkHeaders } from "./bulk";
 export const JMAP_CORE_CAPABILITY = "urn:ietf:params:jmap:core";
 export const JMAP_MAIL_CAPABILITY = "urn:ietf:params:jmap:mail";
 export const JMAP_SUBMISSION_CAPABILITY = "urn:ietf:params:jmap:submission";
+/** JMAP for Contacts (RFC 9610): AddressBook and ContactCard. Fastmail lists it at
+ * https://www.fastmail.com/dev/ as an API-token scope of its own ("Contacts"). */
+export const JMAP_CONTACTS_CAPABILITY = "urn:ietf:params:jmap:contacts";
 
 /** The JMAP session resource, `GET <sessionUrl>` (Fastmail: `https://api.fastmail.com/jmap/session`). */
 export type JmapSessionResource = {
@@ -93,3 +96,36 @@ export type JmapResponseBody = {
 
 /** The `error` method response's `type` (RFC 8620 §3.6.2), when a call fails server-side. */
 export type JmapMethodError = { type: string; description?: string };
+
+/** A JSContact `Name` (RFC 9553 §2.2.1). */
+export type JsContactName = {
+  full?: string;
+  components?: { kind: string; value: string }[];
+};
+
+/**
+ * One JMAP ContactCard (RFC 9610 §3), a JSContact Card (RFC 9553). Only the properties this
+ * gatekeeper requests; every map is keyed by a card-local id. A contact group is a card with
+ * `kind: "group"` whose `members` set holds the `uid`s of the cards in it.
+ */
+export type JmapContactCard = {
+  id: string;
+  uid: string;
+  kind?: string;
+  name?: JsContactName;
+  nicknames?: Record<string, { name: string }>;
+  emails?: Record<string, { address: string; contexts?: Record<string, boolean>; pref?: number; label?: string }>;
+  phones?: Record<string, {
+    number: string; features?: Record<string, boolean>; contexts?: Record<string, boolean>; pref?: number;
+    label?: string;
+  }>;
+  organizations?: Record<string, { name?: string; units?: { name: string }[] }>;
+  titles?: Record<string, { name: string; kind?: string }>;
+  addresses?: Record<string, {
+    full?: string; components?: { kind: string; value: string }[]; contexts?: Record<string, boolean>;
+  }>;
+  onlineServices?: Record<string, { uri?: string; user?: string; service?: string }>;
+  anniversaries?: Record<string, { kind: string; date: { "@type"?: string; year?: number; month?: number; day?: number; utc?: string } }>;
+  notes?: Record<string, { note: string }>;
+  members?: Record<string, boolean>;
+};

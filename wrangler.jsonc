@@ -35,6 +35,12 @@
       "new_sqlite_classes": [
         "FastmailHookDriver"
       ]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": [
+        "FastmailContactsGatekeeperImpl"
+      ]
     }
   ]
 }

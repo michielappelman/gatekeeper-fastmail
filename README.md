@@ -1,9 +1,9 @@
 # Fastmail
 
 Fastmail is a Cloudflare OS gatekeeper that gives the agent and gadgets access to a user's Fastmail
-mailbox over [JMAP](https://www.fastmail.com/dev/). The agent can read, search and organize mail,
-prepare drafts, send, reply and forward, and react to new mail through hooks. Every change waits
-for the user's approval; reads are recorded.
+mailbox and contacts over [JMAP](https://www.fastmail.com/dev/). The agent can read, search and
+organize mail, prepare drafts, send, reply and forward, react to new mail through hooks, and read
+contacts. Every change waits for the user's approval; reads are recorded.
 
 A user connects an account by pasting a Fastmail API token. There is no OAuth flow and no
 deployment-wide secret.
@@ -18,6 +18,9 @@ deployment-wide secret.
 | Draft | `createDraft`, `createReplyDraft`, `createForwardDraft`, draft `update`/`delete` | Yes, auto-approvable |
 | Send | `send`, `reply`, `forward`, draft `send` | Yes, always by a person |
 | Watch for new mail | `subscribeNewMessages` | The user enables each hook |
+| Read contacts (contacts resource) | `listGroups`, `getGroup`, `listContacts`, `searchContacts`, `getContact` | No (recorded) |
+| Change contacts | `createContact`, `updateContact`, `addToGroup`, `removeFromGroup` | Yes, auto-approvable |
+| Delete contacts | `deleteContact` | Yes, always by a person |
 
 What a connection gets depends on two choices the user makes when connecting:
 
@@ -33,7 +36,9 @@ What a connection gets depends on two choices the user makes when connecting:
 
 1. In Fastmail, open [**Settings → Password & Security → API tokens**](https://app.fastmail.com/settings/security/tokens)
    and create a token with **Mail** access. Add **Email submission** only if this connection should be
-   able to send. App passwords (for IMAP, SMTP and POP) do not work with JMAP.
+   able to send, and **Contacts** if it should read or change contacts (a read-only Contacts token
+   can read them; approved changes then fail). App passwords (for IMAP, SMTP and POP)
+   do not work with JMAP.
 2. Paste the token into the gatekeeper's connect form.
 3. Choose the binding scope in the configurator: whole mailbox, one folder, or a saved search.
 
@@ -164,6 +169,45 @@ A whole-mailbox guard admits everything without a network round trip.
 The configurator (`src/configurator/fastmail-account-configurator-ui.tsx`) offers the three modes.
 It loads the folder list through the configurator RPC, which also mints and parses the resource URL
 (`FastmailAccountConfiguratorUI`), so the sandboxed module never re-implements the encoding.
+
+## Contacts
+
+`FASTMAIL_CONTACTS_RESOURCE` is a second, read-only resource of the same connected account, served
+by its own Durable Object (`FastmailContactsGatekeeperImpl`, `src/contacts.ts`) over JMAP for
+Contacts ([RFC 9610](https://www.rfc-editor.org/rfc/rfc9610)):
+
+| Binding | Resource URL | Session type |
+|---|---|---|
+| All contacts | `https://api.fastmail.com/jmap/contacts/account` | `FastmailContactsSession` |
+| One contact group | `…/account#group/<group ContactCard id>` | `FastmailGroupContactsSession` |
+
+A contact group is a ContactCard of kind `group` whose `members` set lists the `uid`s of the cards
+in it. A group binding re-reads that set for every page and every `getContact()`, so membership is
+live: listings query `ContactCard/query` with the members' uids ORed in, a card outside the group is
+refused exactly like a missing one, and a deleted group makes every call fail as not found. Group
+cards themselves are never returned as contacts.
+
+The token needs the **Contacts** scope. Its contacts account comes from the session resource's
+`primaryAccounts["urn:ietf:params:jmap:contacts"]`; a grant stored before contacts were supported
+looks it up once on first use (`UserAccount.getContactsGrant()`). A token without it fails with
+`CONTACTS_NOT_AUTHORIZED` until the account is reconnected with one that has it.
+
+Changes are queued for approval and written by `applyAction()` with one `ContactCard/set`; nothing
+is simulated, so a change shows up in listings only once applied. Creating, editing and group
+membership carry the `contactCreate`/`contactUpdate`/`contactGroup` action kinds and may be
+auto-approved; `deleteContact()` carries none, so a person always approves it. The approval shows
+the exact JSContact properties written (`src/contact-input.ts` maps the agent's input to them).
+
+- `createContact()` writes into the default address book. Its `uid` is minted when queued, so an
+  apply retried after a lost response finds the card instead of creating a second one. Given a
+  group (always, in a group binding), the same request adds that `uid` to the group's `members`.
+- `updateContact()` replaces each property given; `null` or `[]` removes it.
+- A group binding's changes reach only the group's current members, checked when queued and again
+  when applied. It can remove members from its group but not add existing contacts to it, and
+  `deleteContact()` removes the contact from the whole account.
+
+The configurator (`src/configurator/fastmail-contacts-configurator-ui.tsx`) offers all contacts or
+one group, loading groups through `FastmailContactsConfiguratorUI`.
 
 ## Drafts and sending
 

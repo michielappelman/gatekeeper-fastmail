@@ -2,9 +2,10 @@
 
 ## What this repository is
 
-`gatekeeper-fastmail` is a Cloudflare Worker package for Cloudflare OS. It exposes one scoped
-resource: the whole mailbox of one connected Fastmail account. The agent can list/search threads,
-read messages and attachments, organize messages, prepare drafts, and optionally send mail.
+`gatekeeper-fastmail` is a Cloudflare Worker package for Cloudflare OS. It exposes two scoped
+resources of one connected Fastmail account: the mailbox, where the agent can list/search threads,
+read messages and attachments, organize messages, prepare drafts, and optionally send mail; and the
+contacts, either all of them or one contact group, where it can read them and queue changes.
 
 This repository is normally a Git submodule under `cloudflare-os-starter/packages/`. It is not a
 standalone npm package: `@gadgets/*` dependencies resolve from the consuming Cloudflare OS
@@ -41,7 +42,9 @@ The important code paths are:
 src/fastmail.ts       Worker entrypoint, UserAccount, gatekeeper DO, sessions, configurator
 src/fastmail-api.ts   Direct JMAP fetch client and Fastmail session discovery
 src/fastmail-types.ts JMAP wire types and capability constants
-src/resource.ts       Resource URL: whole mailbox, folder or saved search; parsing and validation
+src/resource.ts       Resource URLs: mailbox (whole, folder, saved search) and contacts (all, group)
+src/contacts.ts       Contacts resource: its gatekeeper DO, session, apply, configurator RPC
+src/contact-input.ts  Agent contact input → JSContact card properties, with validation
 src/scope.ts          ScopeGuard: what a binding admits, enforced on every path
 src/cache.ts          Folder cache, pending actions, simulated keyword overlays, draft records
 src/drafts.ts         Draft revision ordering: what the agent sees, apply and reject
@@ -59,6 +62,13 @@ __tests__/             JMAP, resource, cache, and configurator tests
 - The resource URL is `https://api.fastmail.com/jmap/mail/account`, optionally narrowed by
   `#mailbox/<id>` (one folder) or `#search/<canonical JSON filter>` (a saved search). The
   `urlPattern` and the bare whole-mailbox URL are deployed identity; never change their meaning.
+- The contacts resource URL is `https://api.fastmail.com/jmap/contacts/account`, optionally narrowed
+  by `#group/<group ContactCard id>`; its `urlPattern` is deployed identity too. A group binding
+  re-reads the group's `members` on every listing and `getContact()`; a card outside it is refused
+  exactly like a missing one, and group cards are never returned as contacts. Contact changes are
+  queued for approval, and the scope is re-checked when they are applied. `deleteContact()` must
+  never carry an `actionKind`/`autoApprovable`; a group binding must never add existing contacts
+  to its group.
 - Resource parsing must reject foreign hosts, paths, query strings, malformed URLs, unknown hash
   forms, unknown search fields, and empty searches.
 - The binding's `ScopeGuard` (`src/scope.ts`) is the capability boundary. Every read and change goes

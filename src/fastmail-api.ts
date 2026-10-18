@@ -12,8 +12,10 @@ import { escapeHtml } from "@gadgets/gatekeeper-kit/connect-pages";
 import { readTextCapped } from "@gadgets/gatekeeper-kit/response-body";
 import {
   JMAP_CORE_CAPABILITY,
+  JMAP_CONTACTS_CAPABILITY,
   JMAP_MAIL_CAPABILITY,
   JMAP_SUBMISSION_CAPABILITY,
+  type JmapContactCard,
   type JmapEmailAddress,
   type JmapEmailObject,
   type JmapMailboxObject,
@@ -36,6 +38,8 @@ export type FastmailAccountInfo = {
   /** The session's login address: the fallback `From` on drafts when `Identity/get` is unavailable,
    * as it is for a token without Email submission. Absent on grants stored before it was recorded. */
   username?: string;
+  /** The account holding the user's contacts, when the token grants the Contacts scope. */
+  contactsAccountId?: string;
 };
 
 /**
@@ -71,6 +75,7 @@ export async function fetchAccountInfo(
     accountId,
     hasSubmission,
     username: session.username || undefined,
+    contactsAccountId: session.primaryAccounts?.[JMAP_CONTACTS_CAPABILITY] || undefined,
   };
 }
 
@@ -861,4 +866,124 @@ function parseUtcDate(value: string | null | undefined): number | undefined {
   if (typeof value !== "string") return undefined;
   const time = Date.parse(value);
   return Number.isNaN(time) ? undefined : time;
+}
+
+// ---------------------------------------------------------------------------
+// Contacts (JMAP for Contacts, RFC 9610)
+
+const CONTACTS_USING = [JMAP_CORE_CAPABILITY, JMAP_CONTACTS_CAPABILITY];
+
+/** Every ContactCard property the agent-facing contact is built from. */
+const CONTACT_PROPERTIES = [
+  "id", "uid", "kind", "name", "nicknames", "emails", "phones", "organizations", "titles", "addresses",
+  "onlineServices", "anniversaries", "notes",
+];
+
+/** A group card: just what listing groups and checking membership need. */
+const GROUP_PROPERTIES = ["id", "uid", "kind", "name", "members"];
+
+/**
+ * Fetches one page of contact cards matching `filter`, in Fastmail's query order, for
+ * `OffsetCursor.fetchPage(offset, limit)`.
+ */
+export async function queryContactPage(
+  apiUrl: string, apiToken: string, accountId: string, filter: JmapFilter | undefined, offset: number,
+  limit: number, fetchImpl: typeof fetch = fetch,
+): Promise<JmapContactCard[]> {
+  const queryResult = await call(apiUrl, apiToken, CONTACTS_USING, "ContactCard/query", {
+    accountId,
+    filter: filter && Object.keys(filter).length > 0 ? filter : undefined,
+    position: offset,
+    limit,
+  }, fetchImpl);
+  const ids = (queryResult.ids as string[] | undefined) ?? [];
+  return getContactCards(apiUrl, apiToken, accountId, ids, CONTACT_PROPERTIES, fetchImpl);
+}
+
+/** Fetches cards by id in the given order; ids that don't exist are left out. */
+export async function getContactCards(
+  apiUrl: string, apiToken: string, accountId: string, ids: string[],
+  properties: string[] = CONTACT_PROPERTIES, fetchImpl: typeof fetch = fetch,
+): Promise<JmapContactCard[]> {
+  if (ids.length === 0) return [];
+  const result = await call(apiUrl, apiToken, CONTACTS_USING, "ContactCard/get", {
+    accountId, ids, properties,
+  }, fetchImpl);
+  const list = (result.list as JmapContactCard[] | undefined) ?? [];
+  const byOrder = new Map(ids.map((id, index) => [id, index]));
+  return list.toSorted((a, b) => (byOrder.get(a.id) ?? 0) - (byOrder.get(b.id) ?? 0));
+}
+
+/** Every contact group (a card of kind `group`) in the account, with its member uids. */
+export async function listContactGroups(
+  apiUrl: string, apiToken: string, accountId: string, fetchImpl: typeof fetch = fetch,
+): Promise<JmapContactCard[]> {
+  const parsed = await request(apiUrl, apiToken, {
+    using: CONTACTS_USING,
+    methodCalls: [
+      ["ContactCard/query", { accountId, filter: { kind: "group" } }, "q"],
+      ["ContactCard/get", {
+        accountId, "#ids": { resultOf: "q", name: "ContactCard/query", path: "/ids" }, properties: GROUP_PROPERTIES,
+      }, "g"],
+    ],
+  }, fetchImpl);
+  methodResult(parsed, "q", "ContactCard/query");
+  return (methodResult(parsed, "g", "ContactCard/get").list as JmapContactCard[] | undefined) ?? [];
+}
+
+/** One contact group by card id, or undefined when there is no such card or it is not a group. */
+export async function getContactGroup(
+  apiUrl: string, apiToken: string, accountId: string, groupId: string, fetchImpl: typeof fetch = fetch,
+): Promise<JmapContactCard | undefined> {
+  const [card] = await getContactCards(apiUrl, apiToken, accountId, [groupId], GROUP_PROPERTIES, fetchImpl);
+  return card?.kind === "group" ? card : undefined;
+}
+
+/** The address book new contacts go into: the server's default, else the first one. */
+export async function getDefaultAddressBookId(
+  apiUrl: string, apiToken: string, accountId: string, fetchImpl: typeof fetch = fetch,
+): Promise<string> {
+  const result = await call(apiUrl, apiToken, CONTACTS_USING, "AddressBook/get", {
+    accountId, properties: ["id", "isDefault"],
+  }, fetchImpl);
+  const books = (result.list as { id: string; isDefault?: boolean }[] | undefined) ?? [];
+  const book = books.find(candidate => candidate.isDefault) ?? books[0];
+  if (!book) throw new FastmailError("RESOURCE_NOT_FOUND", "This Fastmail account has no address book.");
+  return book.id;
+}
+
+/** The id of the card with this `uid`, if one exists. */
+export async function findContactCardByUid(
+  apiUrl: string, apiToken: string, accountId: string, uid: string, fetchImpl: typeof fetch = fetch,
+): Promise<string | undefined> {
+  const result = await call(apiUrl, apiToken, CONTACTS_USING, "ContactCard/query", {
+    accountId, filter: { uid }, limit: 1,
+  }, fetchImpl);
+  return (result.ids as string[] | undefined)?.[0];
+}
+
+/**
+ * One `ContactCard/set` (RFC 9610 §3.4): creations, patches and destructions applied together.
+ * Throws if Fastmail refuses any of them.
+ */
+export async function setContactCards(
+  apiUrl: string, apiToken: string, accountId: string,
+  changes: {
+    create?: Record<string, Record<string, unknown>>;
+    update?: Record<string, Record<string, unknown>>;
+    destroy?: string[];
+  },
+  fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const result = await call(apiUrl, apiToken, CONTACTS_USING, "ContactCard/set", {
+    accountId, ...changes,
+  }, fetchImpl);
+  for (const key of ["notCreated", "notUpdated", "notDestroyed"] as const) {
+    const failures = result[key] as Record<string, JmapMethodError> | null | undefined;
+    const [id, error] = Object.entries(failures ?? {})[0] ?? [];
+    if (error) {
+      throw new FastmailError(
+        methodErrorCode(error), `Fastmail refused to change contact ${id}: ${describeMethodError(error)}.`);
+    }
+  }
 }

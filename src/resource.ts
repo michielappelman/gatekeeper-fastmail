@@ -1,7 +1,10 @@
 /**
- * The grantable resource this gatekeeper offers — a connected account's Fastmail mailbox, either
- * whole or narrowed to one folder or one saved search — and the parser that turns a bound resource
- * URL into the scope its gatekeeper Durable Object enforces.
+ * The grantable resources this gatekeeper offers, and the parsers that turn a bound resource URL
+ * into the scope its gatekeeper Durable Object enforces:
+ *
+ * - a connected account's Fastmail mailbox, either whole or narrowed to one folder or one saved
+ *   search;
+ * - the same account's contacts, either all of them or one contact group.
  *
  * A resource's `urlPattern` is permanent identity (see gatekeeper-google/src/resources.ts,
  * gatekeeper-jottacloud/src/resource.ts): never change it after deploy. The narrowed bindings live
@@ -12,6 +15,9 @@
  *   https://api.fastmail.com/jmap/mail/account#mailbox/<id>        one folder (a JMAP Mailbox id)
  *   https://api.fastmail.com/jmap/mail/account#search/<filter>     one saved search, the filter as
  *                                                                   percent-encoded canonical JSON
+ *   https://api.fastmail.com/jmap/contacts/account                 every contact
+ *   https://api.fastmail.com/jmap/contacts/account#group/<id>      one contact group (the id of its
+ *                                                                   group ContactCard)
  */
 
 import type { SupportedResource } from "@gadgets/workshop-shared/gatekeeper";
@@ -31,7 +37,17 @@ export const FASTMAIL_RESOURCE: SupportedResource = {
     "mailbox, one folder, or one saved search.",
 };
 
-export const SUPPORTED_RESOURCES: SupportedResource[] = [FASTMAIL_RESOURCE];
+/** The only contacts path minted: one address book set per connected account. */
+const CONTACTS_RESOURCE_PATH = "/jmap/contacts/account";
+
+export const FASTMAIL_CONTACTS_RESOURCE: SupportedResource = {
+  urlPattern: `https://${RESOURCE_HOST}/jmap/contacts/*`,
+  title: "Fastmail Contacts",
+  description:
+    "Read, search, and edit the contacts of one Fastmail account you connect: all of them, or one contact group.",
+};
+
+export const SUPPORTED_RESOURCES: SupportedResource[] = [FASTMAIL_RESOURCE, FASTMAIL_CONTACTS_RESOURCE];
 
 /**
  * A saved search: messages must match every field given. Text fields match as JMAP's
@@ -125,6 +141,58 @@ function validateFolderId(folderId: unknown): string {
     throw new FastmailError("INVALID_RESOURCE", "Not a valid Fastmail folder id.");
   }
   return folderId;
+}
+
+/** What a contacts binding may see. */
+export type FastmailContactsScope =
+  | { kind: "all" }
+  | { kind: "group"; groupId: string };
+
+export const ALL_CONTACTS_SCOPE: FastmailContactsScope = { kind: "all" };
+
+/** Builds a contacts resource's canonical URL for `scope`. */
+export function toContactsResourceUrl(scope: FastmailContactsScope = ALL_CONTACTS_SCOPE): string {
+  const base = `https://${RESOURCE_HOST}${CONTACTS_RESOURCE_PATH}`;
+  return scope.kind === "all" ? base : `${base}#group/${validateGroupId(scope.groupId)}`;
+}
+
+/** Whether `url` names this gatekeeper's contacts resource rather than the mailbox. */
+export function isContactsResourceUrl(url: string): boolean {
+  try {
+    return new URL(url).pathname.startsWith("/jmap/contacts/");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Parses a bound contacts resource URL into its scope. Throws `INVALID_RESOURCE` on any URL naming a
+ * different host or path, or a hash that isn't a valid group scope.
+ */
+export function parseContactsResourceUrl(url: string): FastmailContactsScope {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new FastmailError("INVALID_RESOURCE", "Not a valid resource URL.");
+  }
+  if (parsed.protocol !== "https:" || parsed.hostname !== RESOURCE_HOST ||
+      parsed.pathname !== CONTACTS_RESOURCE_PATH || parsed.search || parsed.username || parsed.password ||
+      parsed.port) {
+    throw new FastmailError(
+      "INVALID_RESOURCE", `Fastmail contacts resource URLs must be https://${RESOURCE_HOST}${CONTACTS_RESOURCE_PATH}.`);
+  }
+  const hash = parsed.hash.replace(/^#/, "");
+  if (!hash) return ALL_CONTACTS_SCOPE;
+  if (hash.startsWith("group/")) return { kind: "group", groupId: validateGroupId(hash.slice("group/".length)) };
+  throw new FastmailError("INVALID_RESOURCE", "Fastmail contacts can be narrowed only to #group/<id>.");
+}
+
+function validateGroupId(groupId: unknown): string {
+  if (typeof groupId !== "string" || !JMAP_ID.test(groupId)) {
+    throw new FastmailError("INVALID_RESOURCE", "Not a valid Fastmail contact group id.");
+  }
+  return groupId;
 }
 
 /**
