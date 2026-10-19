@@ -93,7 +93,9 @@ export type PendingAction =
       answersEmailId?: string;
       /** For a forward: the email being forwarded, marked `$forwarded` once it is sent. */
       forwardsEmailId?: string;
-    };
+    }
+  /** Deleting a masked address: always approved by a person. */
+  | { kind: "maskedEmailDelete"; maskedEmailId: string; email: string };
 
 function pendingActionKey(actionId: number): string {
   return `action:pending:${actionId}`;

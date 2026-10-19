@@ -85,9 +85,15 @@ __tests__/             JMAP, resource, cache, and configurator tests
   capability and a usable sender identity (`requireSender()`). A grant without them is advertised
   as `FastmailDraftOnlySession`, which has no send methods.
 - Every read path authorizes observation through `ApprovalQueue`, including cached and simulated
-  results. Every mutation is queued for approval. Draft changes, read state, keywords and moves
-  carry an `actionKind` and `autoApprovable: true`, so a user may opt in to applying them
-  automatically; anything that sends mail must never carry either, so it always waits for a person.
+  results. Every mutation is queued for approval, except `createMaskedEmail()`, which by design
+  creates the address immediately (it only authorizes observation). Draft changes, read state,
+  keywords and moves carry an `actionKind` and `autoApprovable: true`, so a user may opt in to
+  applying them automatically; anything that sends mail, and `deleteMaskedEmail()`, must never carry
+  either, so it always waits for a person.
+- Masked Email (`https://www.fastmail.com/dev/maskedemail`, its own token scope, account from
+  `UserAccount.getMaskedEmailGrant()`) is whole-mailbox only (`requireWholeMailbox`), absent from the
+  scoped session types. Deleting sets `state: "deleted"`; an apply that finds the address gone is a
+  no-op.
 - Mailbox bindings are private to the connecting account. Observer sharing is intentionally
   rejected.
 - `moveToFolder()` takes a Mailbox id. Use `listFolders()` and the stable `role` field to find

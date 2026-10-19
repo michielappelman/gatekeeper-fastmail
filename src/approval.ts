@@ -7,7 +7,7 @@ import {
 } from "@gadgets/gatekeeper-kit/action-description";
 import type { DraftEmailParams } from "./fastmail-api";
 import { textToHtml } from "./fastmail-api";
-import type { JmapEmailAddress } from "./fastmail-types";
+import type { JmapEmailAddress, JmapMaskedEmail } from "./fastmail-types";
 
 /** Most messages listed for a thread change; the rest are counted. */
 export const MAX_LISTED_MESSAGES = 20;
@@ -76,5 +76,16 @@ export function describeThreadChange(
   } else {
     builder.prose(`Applies to ${messageCount} message(s) ${where}.`);
   }
+  return builder.finish();
+}
+
+/** The description of deleting one masked address, with what identifies it to the approver. */
+export function describeMaskedEmailDelete(masked: JmapMaskedEmail): RenderedDescription {
+  const builder = buildDescription(
+    "Delete this Fastmail masked email address. Fastmail rejects mail sent to it from then on.");
+  builder.inline("Address", masked.email);
+  if (masked.forDomain) builder.inline("For", masked.forDomain);
+  if (masked.description) builder.inline("Description", masked.description);
+  if (masked.lastMessageAt) builder.inline("Last message", masked.lastMessageAt);
   return builder.finish();
 }

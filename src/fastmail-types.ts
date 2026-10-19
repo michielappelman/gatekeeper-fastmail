@@ -15,6 +15,9 @@ export const JMAP_SUBMISSION_CAPABILITY = "urn:ietf:params:jmap:submission";
 /** JMAP for Contacts (RFC 9610): AddressBook and ContactCard. Fastmail lists it at
  * https://www.fastmail.com/dev/ as an API-token scope of its own ("Contacts"). */
 export const JMAP_CONTACTS_CAPABILITY = "urn:ietf:params:jmap:contacts";
+/** Fastmail's Masked Email extension (https://www.fastmail.com/dev/maskedemail): `MaskedEmail/get`
+ * and `MaskedEmail/set`. A separate API-token scope ("Masked Email"). */
+export const MASKED_EMAIL_CAPABILITY = "https://www.fastmail.com/dev/maskedemail";
 
 /** The JMAP session resource, `GET <sessionUrl>` (Fastmail: `https://api.fastmail.com/jmap/session`). */
 export type JmapSessionResource = {
@@ -130,4 +133,16 @@ export type JmapContactCard = {
   anniversaries?: Record<string, { kind: string; date: { "@type"?: string; year?: number; month?: number; day?: number; utc?: string } }>;
   notes?: Record<string, { note: string }>;
   members?: Record<string, boolean>;
+};
+
+/** One Fastmail MaskedEmail object. `deleted` addresses reject mail; `pending` ones are deleted by
+ * Fastmail unless they receive mail within 24 hours. */
+export type JmapMaskedEmail = {
+  id: string;
+  email: string;
+  state: "pending" | "enabled" | "disabled" | "deleted";
+  forDomain?: string | null;
+  description?: string | null;
+  createdAt?: string | null;
+  lastMessageAt?: string | null;
 };

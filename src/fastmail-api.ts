@@ -15,6 +15,8 @@ import {
   JMAP_CONTACTS_CAPABILITY,
   JMAP_MAIL_CAPABILITY,
   JMAP_SUBMISSION_CAPABILITY,
+  MASKED_EMAIL_CAPABILITY,
+  type JmapMaskedEmail,
   type JmapContactCard,
   type JmapEmailAddress,
   type JmapEmailObject,
@@ -40,6 +42,8 @@ export type FastmailAccountInfo = {
   username?: string;
   /** The account holding the user's contacts, when the token grants the Contacts scope. */
   contactsAccountId?: string;
+  /** The account holding the user's Masked Email addresses, when the token grants that scope. */
+  maskedEmailAccountId?: string;
 };
 
 /**
@@ -76,6 +80,7 @@ export async function fetchAccountInfo(
     hasSubmission,
     username: session.username || undefined,
     contactsAccountId: session.primaryAccounts?.[JMAP_CONTACTS_CAPABILITY] || undefined,
+    maskedEmailAccountId: session.primaryAccounts?.[MASKED_EMAIL_CAPABILITY] || undefined,
   };
 }
 
@@ -464,6 +469,68 @@ export async function updateEmails(
     const failure = notUpdated![failedId];
     throw new FastmailError(
       methodErrorCode(failure), `Fastmail rejected the update to ${failedId}: ${failure.type}.`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Masked Email (Fastmail extension)
+
+const MASKED_EMAIL_USING = [JMAP_CORE_CAPABILITY, MASKED_EMAIL_CAPABILITY];
+const MASKED_EMAIL_PROPERTIES = ["id", "email", "state", "forDomain", "description", "createdAt", "lastMessageAt"];
+
+/** Every masked address of the account (`ids: null`), or only those listed. */
+export async function getMaskedEmails(
+  apiUrl: string, apiToken: string, accountId: string, ids: string[] | null = null,
+  fetchImpl: typeof fetch = fetch,
+): Promise<JmapMaskedEmail[]> {
+  const result = await call(apiUrl, apiToken, MASKED_EMAIL_USING, "MaskedEmail/get", {
+    accountId, ids, properties: MASKED_EMAIL_PROPERTIES,
+  }, fetchImpl);
+  return (result.list as JmapMaskedEmail[] | undefined) ?? [];
+}
+
+export type MaskedEmailCreate = { forDomain?: string; description?: string; emailPrefix?: string };
+
+/** Creates one masked address, `enabled` straight away so Fastmail doesn't expire it unused. */
+export async function createMaskedEmail(
+  apiUrl: string, apiToken: string, accountId: string, input: MaskedEmailCreate,
+  fetchImpl: typeof fetch = fetch,
+): Promise<JmapMaskedEmail> {
+  const result = await call(apiUrl, apiToken, MASKED_EMAIL_USING, "MaskedEmail/set", {
+    accountId,
+    create: { m: { state: "enabled", ...input } },
+  }, fetchImpl);
+  const notCreated = (result.notCreated as Record<string, JmapMethodError> | undefined)?.m;
+  if (notCreated) {
+    throw new FastmailError(
+      notCreated.type === "invalidProperties" ? "INVALID_RESOURCE" : methodErrorCode(notCreated),
+      `Fastmail refused to create the masked email: ${describeMethodError(notCreated)}.`);
+  }
+  const created = (result.created as Record<string, Partial<JmapMaskedEmail>> | undefined)?.m;
+  if (typeof created?.id !== "string" || typeof created.email !== "string") {
+    throw new FastmailError("UPSTREAM_UNAVAILABLE", "Fastmail did not report the created masked email.");
+  }
+  return {
+    state: "enabled",
+    forDomain: input.forDomain ?? null,
+    description: input.description ?? null,
+    ...created,
+  } as JmapMaskedEmail;
+}
+
+/** Sets a masked address's state to `deleted`: Fastmail rejects mail sent to it from then on. A
+ * missing or already deleted address is a no-op, so a retried apply succeeds. */
+export async function deleteMaskedEmail(
+  apiUrl: string, apiToken: string, accountId: string, id: string, fetchImpl: typeof fetch = fetch,
+): Promise<void> {
+  const result = await call(apiUrl, apiToken, MASKED_EMAIL_USING, "MaskedEmail/set", {
+    accountId,
+    update: { [id]: { state: "deleted" } },
+  }, fetchImpl);
+  const failure = (result.notUpdated as Record<string, JmapMethodError> | undefined)?.[id];
+  if (failure && failure.type !== "notFound") {
+    throw new FastmailError(
+      methodErrorCode(failure), `Fastmail refused to delete the masked email: ${describeMethodError(failure)}.`);
   }
 }
 

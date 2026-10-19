@@ -18,6 +18,8 @@ deployment-wide secret.
 | Draft | `createDraft`, `createReplyDraft`, `createForwardDraft`, draft `update`/`delete` | Yes, auto-approvable |
 | Send | `send`, `reply`, `forward`, draft `send` | Yes, always by a person |
 | Watch for new mail | `subscribeNewMessages` | The user enables each hook |
+| Masked email (whole-mailbox binding only) | `listMaskedEmails`, `createMaskedEmail` | No (recorded): an address is created immediately |
+| Delete a masked email (whole-mailbox binding only) | `deleteMaskedEmail` | Yes, always by a person |
 | Read contacts (contacts resource) | `listGroups`, `getGroup`, `listContacts`, `searchContacts`, `getContact` | No (recorded) |
 | Change contacts | `createContact`, `updateContact`, `addToGroup`, `removeFromGroup` | Yes, auto-approvable |
 | Delete contacts (whole-contacts binding only) | `deleteContact` | Yes, always by a person |
@@ -45,7 +47,7 @@ What a connection gets depends on two choices the user makes when connecting:
    |**Email submission**|On to send; off for a draft-only connection|`urn:ietf:params:jmap:submission`. Without it the connection is draft-only: the agent prepares drafts and you send them from Fastmail. Requires **Email**.|
    |**Contacts and contact groups**|On if the connection should use contacts|`urn:ietf:params:jmap:contacts`. Without it the contacts methods fail with `CONTACTS_NOT_AUTHORIZED`.|
    |**Vacation response**|Off|Not used.|
-   |**Masked Email**|Off|Not used.|
+   |**Masked Email**|On if the connection should create masked addresses|`https://www.fastmail.com/dev/maskedemail`. Without it the masked email methods fail with `MASKED_EMAIL_NOT_AUTHORIZED`.|
 
    Grant only what the connection needs: the token's scopes are the hard limit on what an agent can
    do, enforced by Fastmail. App passwords (for IMAP, SMTP and POP) do not work with JMAP.

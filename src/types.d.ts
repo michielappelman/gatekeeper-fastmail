@@ -325,6 +325,31 @@ export interface FastmailSendableDraft extends FastmailDraft {
   send(): Promise<void>;
 }
 
+/** One Fastmail masked email address: a generated address that delivers to this mailbox. */
+export type FastmailMaskedEmail = {
+  /** Pass this to `deleteMaskedEmail()`. */
+  id: string;
+  email: string;
+  /** `pending`: created elsewhere and not yet used (Fastmail deletes it after 24 hours unless it
+   * receives mail); `disabled`: mail to it goes to Trash. */
+  state: "pending" | "enabled" | "disabled" | "deleted";
+  /** The website it was made for, as a URL origin such as `"https://example.com"`. */
+  forDomain?: string;
+  description?: string;
+  createdAt?: Date;
+  lastMessageAt?: Date;
+};
+
+/** Options for `createMaskedEmail()`. */
+export type FastmailMaskedEmailInput = {
+  /** The website it is for: `"example.com"` or `"https://example.com"`. */
+  forDomain?: string;
+  /** A note for the user, at most 255 characters. */
+  description?: string;
+  /** The start of the generated address: 1-64 lower-case letters, digits or underscores. */
+  emailPrefix?: string;
+};
+
 /**
  * Access to one connected Fastmail account's whole mailbox, for an account that can prepare drafts
  * but not send mail: read, search and organize email, and write drafts for the user to review and
@@ -425,6 +450,28 @@ export interface FastmailDraftOnlySession {
    * isn't in the Drafts folder.
    */
   getDraft(id: string): Promise<FastmailDraft>;
+
+  /**
+   * Lists the account's Fastmail masked email addresses (deleted ones are left out). Needs an API
+   * token with the Masked Email scope; otherwise every masked email method throws
+   * `MASKED_EMAIL_NOT_AUTHORIZED`.
+   */
+  listMaskedEmails(): Promise<FastmailMaskedEmail[]>;
+
+  /**
+   * Creates a new masked email address straight away, without waiting for approval, and returns
+   * it. Mail sent to it is delivered to this mailbox.
+   *
+   * @example
+   * const { email } = await env.FASTMAIL.createMaskedEmail({ forDomain: "shop.example.com", description: "Shop account" });
+   */
+  createMaskedEmail(options?: FastmailMaskedEmailInput): Promise<FastmailMaskedEmail>;
+
+  /**
+   * Queues deleting a masked email address (an id from `listMaskedEmails()`); always waits for the
+   * user to approve it. Once deleted, Fastmail rejects mail sent to it. Resolves when queued.
+   */
+  deleteMaskedEmail(id: string): Promise<void>;
   /**
    * Have `hook.receiveMessage()` called with each new message that arrives in a folder: the inbox
    * unless `options.folderId` names another (a `FastmailFolder.id`, e.g. one your Fastmail rules

@@ -35,7 +35,8 @@ import {
 } from "@gadgets/gatekeeper-kit/connect-nonce";
 import { OffsetCursor } from "@gadgets/gatekeeper-kit/cursors";
 import {
-  describeSend, describeThreadChange, formatAddress, MAX_LISTED_MESSAGES, type MessageSummary,
+  describeMaskedEmailDelete, describeSend, describeThreadChange, formatAddress, MAX_LISTED_MESSAGES,
+  type MessageSummary,
 } from "./approval";
 import type { RenderedDescription } from "@gadgets/gatekeeper-kit/action-description";
 import {
@@ -88,13 +89,17 @@ import {
   sendEmail,
   textToHtml,
   updateEmails,
+  createMaskedEmail,
+  deleteMaskedEmail,
+  getMaskedEmails,
   type FastmailAccountInfo,
+  type MaskedEmailCreate,
   type JmapFilter,
   type JmapReplySource,
   type RawThreadEntry,
   type SendEmailParams,
 } from "./fastmail-api";
-import type { JmapAttachment, JmapEmailObject, JmapMailboxObject } from "./fastmail-types";
+import type { JmapAttachment, JmapEmailObject, JmapMailboxObject, JmapMaskedEmail } from "./fastmail-types";
 import {
   handlePush,
   type FastmailHookDelivery,
@@ -128,6 +133,8 @@ import type {
   FastmailDraftPatch,
   FastmailFolder,
   FastmailMarkdownContent,
+  FastmailMaskedEmail,
+  FastmailMaskedEmailInput,
   FastmailMessage,
   FastmailSearch,
   FastmailMessageEntry,
@@ -484,6 +491,26 @@ export class UserAccount extends DurableObject<Env> {
     return { apiUrl: grant.apiUrl, apiToken: grant.apiToken, accountId: grant.contactsAccountId };
   }
 
+  /** As `getContactsGrant()`, for the account holding Masked Email addresses. A token without the
+   * Masked Email scope gets `MASKED_EMAIL_NOT_AUTHORIZED`. */
+  async getMaskedEmailGrant(): Promise<{ apiUrl: string; apiToken: string; accountId: string }> {
+    let grant = await this.getGrant();
+    if (!grant.maskedEmailAccountId) {
+      const info = await fetchAccountInfo(grant.apiToken);
+      if (info.maskedEmailAccountId) {
+        grant = { ...grant, maskedEmailAccountId: info.maskedEmailAccountId };
+        this.ctx.storage.kv.put("grant", grant);
+      }
+    }
+    if (!grant.maskedEmailAccountId) {
+      throw new FastmailError(
+        "MASKED_EMAIL_NOT_AUTHORIZED",
+        "This Fastmail connection's API token does not grant Masked Email access. Reconnect with a " +
+        "token that includes the Masked Email scope.");
+    }
+    return { apiUrl: grant.apiUrl, apiToken: grant.apiToken, accountId: grant.maskedEmailAccountId };
+  }
+
   /** Called by a session when a live JMAP call comes back 401, since there is no refresh to retry
    * first — a rejected token here means it was revoked or deleted in Fastmail's own settings. */
   async noteCredentialsExpired(): Promise<void> {
@@ -703,6 +730,50 @@ function toAgentFolder(mailbox: JmapMailboxObject): FastmailFolder {
     totalEmails: mailbox.totalEmails,
     unreadEmails: mailbox.unreadEmails,
   };
+}
+
+function toAgentMaskedEmail(masked: JmapMaskedEmail): FastmailMaskedEmail {
+  return {
+    id: masked.id,
+    email: masked.email,
+    state: masked.state,
+    ...masked.forDomain ? { forDomain: masked.forDomain } : {},
+    ...masked.description ? { description: masked.description } : {},
+    ...masked.createdAt ? { createdAt: new Date(masked.createdAt) } : {},
+    ...masked.lastMessageAt ? { lastMessageAt: new Date(masked.lastMessageAt) } : {},
+  };
+}
+
+/** Validates `createMaskedEmail()`'s options: `forDomain` becomes a URL origin, as Fastmail wants. */
+function normalizeMaskedEmailInput(options: FastmailMaskedEmailInput): MaskedEmailCreate {
+  const input: MaskedEmailCreate = {};
+  if (options.forDomain !== undefined) {
+    const raw = options.forDomain.trim();
+    let url: URL | undefined;
+    try {
+      url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`);
+    } catch {}
+    if (!url || (url.protocol !== "https:" && url.protocol !== "http:") || !url.hostname.includes(".")) {
+      throw new FastmailError(
+        "INVALID_RESOURCE", "forDomain must be a website, such as \"example.com\" or \"https://example.com\".");
+    }
+    input.forDomain = url.origin;
+  }
+  if (options.description !== undefined) {
+    const description = options.description.trim();
+    if (description.length > 255) {
+      throw new FastmailError("INVALID_RESOURCE", "description is at most 255 characters.");
+    }
+    if (description) input.description = description;
+  }
+  if (options.emailPrefix !== undefined) {
+    if (!/^[a-z0-9_]{1,64}$/.test(options.emailPrefix)) {
+      throw new FastmailError(
+        "INVALID_RESOURCE", "emailPrefix is 1-64 lower-case letters, digits or underscores.");
+    }
+    input.emailPrefix = options.emailPrefix;
+  }
+  return input;
 }
 
 function formatAddresses(addresses: JmapEmailObject["from"] | null | undefined): string {
@@ -952,6 +1023,9 @@ export class FastmailGatekeeperImpl extends DurableObject<Env, FastmailGatekeepe
         } else if (pending.kind === "draft") {
           await this.#withDraftLock(
             pending.draftId, () => applyDraftRevision(this.ctx.storage.kv, actionId, pending.draftId, grant));
+        } else if (pending.kind === "maskedEmailDelete") {
+          const masked = await this.#userAccount().getMaskedEmailGrant();
+          await deleteMaskedEmail(masked.apiUrl, masked.apiToken, masked.accountId, pending.maskedEmailId);
         } else {
           await updateEmails(
             grant.apiUrl, grant.apiToken, grant.accountId, grant.hasSubmission, pending.emailIds,
@@ -1497,6 +1571,50 @@ export class FastmailSessionImpl extends RpcTarget implements FastmailSession {
         htmlBody: draft.html,
         attachments,
       });
+  }
+
+  async listMaskedEmails(): Promise<FastmailMaskedEmail[]> {
+    this.#guard.requireWholeMailbox("manage masked email addresses");
+    const grant = await this.#call(() => this.#account.getMaskedEmailGrant());
+    const list = await this.#call(() => getMaskedEmails(grant.apiUrl, grant.apiToken, grant.accountId));
+    const live = list.filter(masked => masked.state !== "deleted");
+    await this.#approvalQueue.authorizeObservation({
+      title: "List Fastmail masked emails",
+      description: `Read ${live.length} Fastmail masked email address(es).`,
+    });
+    return live.map(toAgentMaskedEmail);
+  }
+
+  async createMaskedEmail(options: FastmailMaskedEmailInput = {}): Promise<FastmailMaskedEmail> {
+    this.#guard.requireWholeMailbox("manage masked email addresses");
+    const input = normalizeMaskedEmailInput(options);
+    const grant = await this.#call(() => this.#account.getMaskedEmailGrant());
+    // Not an approval: creating a masked address is deliberately immediate. It only records that
+    // the agent learned the new address.
+    await this.#approvalQueue.authorizeObservation({
+      title: "Create a Fastmail masked email",
+      description: `Create a new Fastmail masked email address${input.forDomain ? ` for ${input.forDomain}` : ""}.`,
+    });
+    const created = await this.#call(() => createMaskedEmail(grant.apiUrl, grant.apiToken, grant.accountId, input));
+    return toAgentMaskedEmail(created);
+  }
+
+  async deleteMaskedEmail(id: string): Promise<void> {
+    this.#guard.requireWholeMailbox("manage masked email addresses");
+    const missing = () => new FastmailError(
+      "RESOURCE_NOT_FOUND", "That masked email was not found. Use an id from listMaskedEmails().");
+    if (!/^[A-Za-z0-9_-]{1,255}$/.test(id)) throw missing();
+    const grant = await this.#call(() => this.#account.getMaskedEmailGrant());
+    const [masked] = await this.#call(() => getMaskedEmails(grant.apiUrl, grant.apiToken, grant.accountId, [id]));
+    if (!masked || masked.state === "deleted") throw missing();
+    const actionId = nextActionId(this.#kv);
+    setPendingAction(this.#kv, actionId, { kind: "maskedEmailDelete", maskedEmailId: id, email: masked.email });
+    // Not cleaned up on a thrown error: see stageSend(). No actionKind: a person always decides.
+    await this.#approvalQueue.submitAction(actionId, {
+      title: "Delete Fastmail masked email",
+      ...describeMaskedEmailDelete(masked),
+      implementsRevert: false,
+    });
   }
 
   async listDrafts(): Promise<FastmailDraftInfo[]> {
