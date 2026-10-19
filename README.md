@@ -96,7 +96,7 @@ export default async function(self, env) {
 The object model:
 
 - **Session** (`FastmailSession`, `FastmailDraftOnlySession`, or a scoped variant): folders,
-  listings, searches, drafts, `send()` and hooks.
+  listings, searches, drafts, `send()`, hooks and masked email addresses.
 - **Thread** (`FastmailThread`): `messages()` oldest first; `reply()` and `createReplyDraft()`
   answer the newest message; organizing verbs act on every message in the thread.
 - **Several threads** (`session.updateThreads(threadIds, change)`): one queued action, one approval
@@ -126,12 +126,14 @@ There are no Gmail-style `archive()` or `trash()` verbs. Find the folder whose `
 renamed, roles cannot.
 
 Errors carry a stable `FastmailErrorCode` (`src/errors.ts`), such as `AUTH_EXPIRED`,
-`SUBMISSION_NOT_AUTHORIZED`, `CONTACTS_NOT_AUTHORIZED`, `RESOURCE_NOT_FOUND`,
+`SUBMISSION_NOT_AUTHORIZED`, `CONTACTS_NOT_AUTHORIZED`, `MASKED_EMAIL_NOT_AUTHORIZED`, `RESOURCE_NOT_FOUND`,
 `UNSUPPORTED_FOR_MARKDOWN` and `TOO_LARGE_FOR_MARKDOWN`.
 
 ## How a change runs
 
-Every mutation goes through the session's `ApprovalQueue`:
+Every mutation goes through the session's `ApprovalQueue`. The one exception is
+`createMaskedEmail()`, which creates the address in Fastmail at once (recorded as an observation,
+never queued): a new address only receives mail, so it needs no gate. Every other mutation runs:
 
 1. The method validates its input and checks the target against the binding's `ScopeGuard`.
 2. It builds an approval description with gatekeeper-kit's `ActionDescriptionBuilder`
@@ -154,6 +156,10 @@ automatically: `draftCreate`, `draftUpdate`, `draftDelete`, `readState`, `keywor
 `updateThreads()` carries the same kind as the single-thread verb it stands for.
 Anything that sends mail carries no action kind, so it always waits for a person. Auto-approving the
 three draft kinds gives "the agent may prepare drafts, but nothing is sent without me".
+`deleteMaskedEmail()` carries no action kind either: deleting an address that sites and people
+may still use always waits for a person. The approval shows the address, its website, description
+and last-message time; applying it sets the address's `state` to `deleted`, after which Fastmail
+rejects mail sent to it.
 
 Approved changes are not reversible through the gatekeeper.
 
@@ -190,8 +196,8 @@ https://api.fastmail.com/jmap/mail/account#search/%7B%22from%22%3A%22billing%40e
   admitted.
 - `listFolders()` shows only the binding's own folder plus Inbox, Archive, Trash and Junk, and mail
   can be moved only into those. A parent folder outside that set shows as `parentId: null`.
-- `send()` and `createDraft()` are not available; replying, drafting a reply and forwarding a
-  message in scope are.
+- `send()`, `createDraft()` and the masked email methods are not available; replying, drafting a
+  reply and forwarding a message in scope are.
 - Ids outside the scope are refused exactly like ids that do not exist.
 
 A whole-mailbox guard admits everything without a network round trip.
@@ -452,6 +458,9 @@ The driver learns of new mail in two ways:
 - **Sending.** Every send path waits for a person. On a draft-only connection the gatekeeper does
   not advertise send methods, refuses them at runtime, and Fastmail refuses `EmailSubmission/set`
   for the token, so the mode is enforced by the provider as well.
+- **Masked Email.** Creating addresses is the only unapproved write. It needs the token's Masked
+  Email scope, is limited to whole-mailbox bindings, and can't read or send mail. Deleting one
+  always waits for a person.
 - **Observers.** Strategy A (private-only, see the `write-gatekeeper` skill's "Observer
   verification"): Fastmail exposes no per-observer ACL on a personal mailbox to check a second
   account against, so `addObserver()` always throws, as in the Google and Jottacloud gatekeepers.
@@ -561,6 +570,8 @@ contributors and agents are in [AGENTS.md](AGENTS.md).
   address is knowable.
 - **Untrusted content.** Message bodies, headers and attachments come from senders. An agent that
   reads them can meet a prompt injection.
+- **Masked Email is untested live.** Its method names, states and the `emailPrefix` rule follow
+  Fastmail's documentation; the tests use a mocked API.
 
 ## License
 

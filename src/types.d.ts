@@ -353,8 +353,8 @@ export type FastmailMaskedEmailInput = {
 /**
  * Access to one connected Fastmail account's whole mailbox, for an account that can prepare drafts
  * but not send mail: read, search and organize email, and write drafts for the user to review and
- * send from Fastmail. The account was chosen when this connection was created and cannot be changed
- * from here.
+ * send from Fastmail, and create masked email addresses. The account was chosen when this
+ * connection was created and cannot be changed from here.
  */
 export interface FastmailDraftOnlySession {
   /** Lists every folder in the mailbox. */
@@ -725,8 +725,8 @@ export interface FastmailMessageRef extends FastmailDraftOnlyMessageRef {
  * matching one saved search, chosen when this connection was created. Nothing else in the mailbox
  * is visible: listings, searches and hooks cover only those messages, and a thread shows only its
  * messages that are within scope. A message that leaves the folder, or stops matching the search,
- * leaves scope too. This connection can't write new mail, but can reply to messages in scope (as
- * drafts, for this account).
+ * leaves scope too. This connection can't write new mail or manage masked email addresses, but can
+ * reply to messages in scope (as drafts, for this account).
  */
 export interface FastmailScopedDraftOnlySession {
   /**

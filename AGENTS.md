@@ -155,10 +155,16 @@ Important protocol details:
   `ContactCard/set` with `ifInState`, recomputing on `stateMismatch` up to 3 attempts. Removals
   already satisfied are no-ops; at staging a removal that matches nothing is `INVALID_RESOURCE`.
   Keep the match rules in `contact-input.ts` in step with how `toAgentContact` shows each value.
+- Masked Email calls `MaskedEmail/get` and `MaskedEmail/set` with `using` Core + the Masked Email
+  capability only, against `primaryAccounts[https://www.fastmail.com/dev/maskedemail]`. A creation
+  sends `state: "enabled"` (a `pending` address expires after 24 hours unused) and `forDomain`
+  normalized to a URL origin; a delete is an update to `state: "deleted"`, with `notFound` treated
+  as done. These shapes follow Fastmail's documentation and were not verified against a live account.
 
-When changing protocol code, update `__tests__/fastmail-client.test.ts` (mail) or
-`__tests__/contacts.test.ts` (contacts; its fake reproduces Fastmail's `kind` quirk) and keep the
-tests using mocked `fetch`; no Fastmail credentials belong in the repository.
+When changing protocol code, update `__tests__/fastmail-client.test.ts` (mail),
+`__tests__/contacts.test.ts` (contacts; its fake reproduces Fastmail's `kind` quirk) or
+`__tests__/masked-email.test.ts` (masked email) and keep the tests using mocked `fetch`; no Fastmail
+credentials belong in the repository.
 
 ## Cache and pending-action behavior
 
@@ -237,7 +243,8 @@ hand: change `cloudflare.config.ts` and run `pnpm configs:generate` from the sta
 
 Tests use mocked `fetch` and do not need Fastmail credentials. Coverage includes session discovery,
 capability checks, JMAP request/response mapping, resource validation, caching, simulated keywords,
-contacts (listing, group scope, queued changes and their apply), and configurator behavior. Full
+contacts (listing, group scope, queued changes and their apply), masked email (immediate creation,
+approval-only deletion, scope refusal), and configurator behavior. Full
 live-account and Durable Object `ctx.exports` integration coverage
 is not part of the current test suite. The hook driver's logic (`HookDriver`) is tested on fake
 storage with a test-side Web Push encryptor standing in for Fastmail (`__tests__/hooks.test.ts`),
